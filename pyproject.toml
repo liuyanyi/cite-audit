@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools==84.1.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cite-audit"
+version = "0.1.0"
+description = "Local, evidence-first BibTeX citation auditing workbench"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "pydantic==2.13.4",
+  "python-multipart==0.0.32",
+  "uvicorn==0.52.1",
+]
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.setuptools.package-data]
+app = ["static/*", "migrations/*.sql"]
