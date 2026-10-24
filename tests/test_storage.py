@@ -1,3 +1,4 @@
+import os
 import tempfile
 import time
 import unittest
@@ -60,7 +61,18 @@ class StorageTests(unittest.TestCase):
         self.assertNotIn('unique-test-secret', str(cfg.public()))
         self.assertTrue(cfg.public()['llm']['api_key_configured'])
         self.assertNotIn('unique-test-secret', str(cfg.redact({'error':'oops unique-test-secret'})))
-        self.assertEqual(0o600, cfg.path.stat().st_mode & 0o777)
+        if os.name != 'nt':
+            self.assertEqual(0o600, cfg.path.stat().st_mode & 0o777)
+        else:
+            # Windows chmod controls read-only, not POSIX owner/group ACLs.
+            self.assertTrue(cfg.path.stat().st_mode & 0o200)
+    def test_unicode_configuration_is_utf8_and_survives_reload(self):
+        cfg=Config(Path(self.tmp.name));cfg.update({'llm':{'model':'中文模型','api_key':'测试-key'}})
+        self.assertIn('中文模型',cfg.path.read_bytes().decode('utf-8'))
+        restored=Config(Path(self.tmp.name))
+        self.assertEqual('中文模型',restored.get()['llm']['model'])
+        self.assertNotIn('测试-key',str(restored.public()))
+
     def test_secret_with_json_metacharacters(self):
         cfg = Config(Path(self.tmp.name))
         secret = 'synthetic-"quoted\\key'

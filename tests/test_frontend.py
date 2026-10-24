@@ -6,6 +6,7 @@ Node.js is optional for application users and required only for this JS test.
 """
 from pathlib import Path
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -50,11 +51,13 @@ class FrontendContractTests(unittest.TestCase):
                     'parse_issues': []}
             fixture = Path(directory) / 'task.json'
             fixture.write_text(json.dumps(task), encoding='utf-8')
-            result = subprocess.run([shutil.which('node'), str(ROOT / 'tests/frontend_smoke.js'), str(fixture)],
-                                    cwd=ROOT, text=True, capture_output=True, timeout=20)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn('"rendering":"passed"', result.stdout)
-            self.assertIn('Unverified DOI labels and filters passed.', result.stdout)
+            for line_endings in ('native', 'crlf'):
+                environment = {**os.environ, 'CITE_AUDIT_TEST_CRLF': '1' if line_endings == 'crlf' else '0'}
+                result = subprocess.run([shutil.which('node'), str(ROOT / 'tests/frontend_smoke.js'), str(fixture)],
+                                        cwd=ROOT, text=True, encoding='utf-8', capture_output=True, timeout=20, env=environment)
+                self.assertEqual(result.returncode, 0, line_endings + ': ' + result.stdout + result.stderr)
+                self.assertIn('"rendering":"passed"', result.stdout)
+                self.assertIn('Unverified DOI labels and filters passed.', result.stdout)
 
 
 if __name__ == '__main__':

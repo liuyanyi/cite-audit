@@ -44,7 +44,7 @@ class Config:
         self.lock = threading.RLock()
         self.data = copy.deepcopy(DEFAULTS)
         if self.path.exists():
-            saved = json.loads(self.path.read_text())
+            saved = json.loads(self.path.read_text(encoding='utf-8'))
             for key, val in saved.items():
                 if key in self.data:
                     if isinstance(val, dict): self.data[key].update(val)
@@ -105,7 +105,7 @@ class Config:
                         candidate[group][key] = val
             temp = self.path.with_suffix('.tmp')
             descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(descriptor, 'w') as handle:
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
                 json.dump(candidate, handle, ensure_ascii=False, indent=2)
             os.replace(temp, self.path)
             os.chmod(self.path, 0o600)

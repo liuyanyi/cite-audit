@@ -10,12 +10,15 @@ class Element {
  showModal(){this.open=true} close(){this.open=false;this.events.close?.({})} focus(){} scrollIntoView(){} remove(){} select(){}
  set textContent(v){this.children=[String(v)]} get textContent(){return this.children.map(n=>n instanceof Element?n.textContent:String(n)).join('')}
 }
-const html=fs.readFileSync(path.join(root,'app/static/index.html'),'utf8'),source=fs.readFileSync(path.join(root,'app/static/app.js'),'utf8');
+const html=fs.readFileSync(path.join(root,'app/static/index.html'),'utf8');
+let source=fs.readFileSync(path.join(root,'app/static/app.js'),'utf8');
+if(process.env.CITE_AUDIT_TEST_CRLF==='1')source=source.replace(/\r?\n/g,'\r\n');
 const nodes={}; for(const m of html.matchAll(/id="([^"]+)"/g)){if(nodes[m[1]])throw Error('Duplicate HTML ID '+m[1]);nodes[m[1]]=new Element();}
 for(const m of source.matchAll(/\$\('([^']+)'\)/g)){if(!nodes[m[1]])throw Error('Missing static HTML ID '+m[1]);}
 const document={getElementById:id=>nodes[id]||(nodes[id]=new Element()),createElement:tag=>new Element(tag),createElementNS:(_,tag)=>new Element(tag),createTextNode:t=>String(t),querySelectorAll:()=>[],querySelector:()=>null,addEventListener:()=>{},body:new Element(),hidden:false};
 const ctx={document,Node:Element,URL,console,setTimeout:()=>1,clearTimeout:()=>{},Date,Map,Set,JSON,Object,Array,String,Number,Promise,window:{isSecureContext:false},navigator:{},CSS:{escape:String},localStorage:{setItem:()=>{}}};
-vm.createContext(ctx); vm.runInContext(source.replace(/  init\(\);\n\}\)\(\);\s*$/, '  globalThis.__test = {state, renderTask, renderDetail, renderEntries, el, matches};\n})();'),ctx);
+vm.createContext(ctx); vm.runInContext(source.replace(/  init\(\);\r?\n\}\)\(\);\s*$/, '  globalThis.__test = {state, renderTask, renderDetail, renderEntries, el, matches};\n})();'),ctx);
+if(!ctx.__test)throw Error('Frontend test hook was not installed');
 const task=JSON.parse(fs.readFileSync(process.argv[2],'utf8')); const api=ctx.__test;api.state.task=task; api.state.tasks=[task];
 for(const entry of task.entries){ api.state.selected=entry.id; api.renderTask(); for(const tab of ['comparison','evidence','original','queries']){api.state.tab=tab;api.renderDetail();if(!nodes['entry-detail'].textContent)throw Error('Empty detail '+tab);}}
 api.state.query='';for(const filter of ['all','issues','conflict','missing_doi','upgrade','insufficient','failed','chinese']){api.state.filter=filter;api.renderEntries()}

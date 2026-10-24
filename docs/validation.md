@@ -5,9 +5,9 @@
 ## 已执行
 
 - 在 Linux/Python 3.12 干净 venv 中从公开包源安装 `requirements.lock`，成功。
-- `python -m unittest discover -s tests -v`：159 项通过，覆盖解析、身份/字段/DOI/版本、真实适配器的 HTTP 模拟、网络安全、SQLite、API 集成、配置、文件锁和前端 DOM 合约。
+- `python -m unittest discover -s tests -v`：161 项通过，覆盖解析、身份/字段/DOI/版本、真实适配器的 HTTP 模拟、网络安全、SQLite、API 集成、配置、文件锁和前端 DOM 合约。
 - `node --check app/static/app.js`、`python -m compileall -q app`、`git diff --check`：通过。
-- 前端无浏览器 smoke：8 个代表条目 × 4 个详情标签页、8 类筛选、证据引用/状态/ARIA/安全链接及 token/CNKI 标签。
+- 前端无浏览器 smoke：8 个代表条目 × 4 个详情标签页，分别测试本机换行与强制 CRLF，8 类筛选、证据引用/状态/ARIA/安全链接及 token/CNKI 标签。
 - 解析器额外执行 3000 个有种子的损坏输入及长坏链/大量 `@` 场景，未发现崩溃或无界扫描。
 - wheel 构建、安装到独立目录，并从非仓库工作目录验证迁移、静态页面、后台队列、上传审核、原始字节下载：通过。
 - 独立只读审查复验：引用关系不冒充版本关系、凭据轮换缓存脱敏、作者补全证据重用、未登记 DOI、长 Retry-After、不兼容配置重试以及人工删除后不复活，均通过。
@@ -52,3 +52,7 @@
 - Windows 锁实现有模拟单元测试；原生 Windows/macOS 整体运行在本次本地开发环境未实机验证。GitHub Actions 配置了 Ubuntu/Windows 的离线测试和 wheel 构建，其实际状态以提交对应检查为准。
 - CNKI 仅公开网页补充，真实 CNKI 导出样本兼容性未验证；不声称总库/API 覆盖。
 - 模型网页抽取是待人工核对线索，不保证自动解决疑难作者变体/候选歧义。
+
+## 跨平台回归补充
+
+首次 Windows CI 暴露前端测试钩子的 CRLF 假设和 POSIX 权限断言。已修正测试的换行支持及平台权限语义，保留全部配置脱敏断言；同时为应用配置读写显式指定 UTF-8，新增中文模型/密钥持久化回归与真实平台文件锁/后台线程/关闭释放锁测试。最终提交的双平台 CI 状态以 PR 检查为准。
