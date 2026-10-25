@@ -182,6 +182,9 @@ test("deleting a captured task never clears a newer task selected before confirm
   render(<App />);
   await screen.findByRole("heading", { name: "a.bib" });
   fireEvent.click(screen.getByRole("button", { name: "删除" }));
+  expect(screen.getByRole("dialog").textContent).toContain(
+    "文献库与来源快照、调用审计与费用记录",
+  );
   fireEvent.click(screen.getByRole("button", { name: /b\.bib/ }));
   await screen.findByRole("heading", { name: "b.bib" });
   fireEvent.click(screen.getByRole("button", { name: "删除检查" }));
@@ -206,6 +209,9 @@ test("cancelling a destructive confirmation sends no mutation", async () => {
   render(<App />);
   await screen.findByRole("heading", { name: "a.bib" });
   fireEvent.click(screen.getByRole("button", { name: "删除" }));
+  expect(screen.getByRole("dialog").textContent).toContain(
+    "文献库与来源快照、调用审计与费用记录",
+  );
   fireEvent(
     screen.getByRole("dialog"),
     new Event("cancel", { cancelable: true }),

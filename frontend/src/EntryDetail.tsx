@@ -22,6 +22,9 @@ export interface Evidence {
   version?: string | number;
   cache_hit?: boolean;
   cached?: boolean;
+  cache_state?: string;
+  last_checked_at?: string;
+  revalidation_error?: string;
   raw?: unknown;
 }
 export interface Assessment {
@@ -658,8 +661,8 @@ export function EntryDetail({
             {result.expires_at && (
               <p className="source-meta evidence-check-meta">
                 {new Date(result.expires_at).getTime() < Date.now()
-                  ? "核验结果已过期，可刷新此条目。"
-                  : "核验结果有效至 " + formatDate(result.expires_at, true)}
+                  ? "历史核验结果待复核，可复核此条目。"
+                  : "建议复核时间 " + formatDate(result.expires_at, true)}
               </p>
             )}
             {(result.cache_source || result.checked_at) && (
@@ -713,18 +716,24 @@ export function EntryDetail({
                         tone={
                           method === "mock" || method === "manual"
                             ? "manual"
-                            : isLead
+                            : record.cache_state === "stale"
                               ? "warning"
-                              : "good"
+                              : isLead
+                                ? "warning"
+                                : "good"
                         }
                       >
                         {method === "mock"
                           ? "模拟证据"
                           : method === "manual"
                             ? "人工 · 未在线核验"
-                            : isLead
-                              ? "检索线索 · 待核验"
-                              : "在线获取"}
+                            : record.cache_state === "stale"
+                              ? record.revalidation_error
+                                ? "历史证据 · 复核失败"
+                                : "历史证据 · 待复核"
+                              : isLead
+                                ? "检索线索 · 待核验"
+                                : "在线获取"}
                       </Badge>
                     </div>
                     {record.url && (
@@ -738,12 +747,15 @@ export function EntryDetail({
                   )}
                   <div className="source-meta">
                     获取 {formatDate(record.retrieved_at, true)}
+                    {record.last_checked_at
+                      ? ` · 最近复核 ${formatDate(record.last_checked_at, true)}`
+                      : ""}
                     {record.version ? ` · 证据版本 ${record.version}` : ""}
                     {record.expires_at
                       ? " · " +
                         (expired
-                          ? "已过期"
-                          : "有效至 " + formatDate(record.expires_at, true))
+                          ? "待复核"
+                          : "建议复核 " + formatDate(record.expires_at, true))
                       : ""}
                     {record.cache_hit || record.cached ? " · 缓存" : ""}
                   </div>

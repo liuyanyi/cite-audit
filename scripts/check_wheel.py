@@ -50,7 +50,20 @@ with tempfile.TemporaryDirectory() as data:
         assert detail['entries'] and detail['api_calls'] == 0
         original = client.get('/api/tasks/' + task.json()['id'] + '/source')
         assert original.content == sample.content
-print('Installed wheel: React assets, demo, offline task and source download passed.')
+        task_id = task.json()['id']
+        preview = client.get('/api/tasks/' + task_id + '/export-preview')
+        assert preview.status_code == 200 and preview.json()['entries']
+        exported = client.post('/api/tasks/' + task_id + '/export', json={'selections': []})
+        assert exported.status_code == 200 and exported.json()['bibtex'].encode() == sample.content
+        library = client.get('/api/library').json()
+        assert library['total'] > 0
+        assert client.get('/api/library/' + library['items'][0]['id']).json()['snapshots']
+        audit = client.get('/api/audit').json()
+        assert audit['summary']['total_calls'] == 0
+        assert client.delete('/api/tasks/' + task_id).status_code == 200
+        assert client.get('/api/library').json()['total'] == library['total']
+        assert client.get('/api/audit').json()['total'] == audit['total']
+print('Installed wheel: React assets, offline task, source/export preservation and persistent library/audit passed.')
 '''], check=True, cwd=temporary, env=environment)
 
 

@@ -9,7 +9,7 @@ import threading
 import time
 import unicodedata
 
-from .audit import assess
+from .audit import assess, RULE_VERSION
 from .locking import InstanceLock
 from .bibtex import render_suggestion
 from .providers import ProviderService
@@ -108,18 +108,24 @@ class Worker:
 
     def run_entry(self, entry):
         task = self.db.task(entry['task_id'])
-        if task['config_hash'] != self.config.fingerprint(task['mode']):
+        try:
+            model_id = task.get('options', {}).get('model_id')
+            fingerprint = self.config.fingerprint(task['mode'], model_id)
+            settings = self.config.get(model_id)
+        except ValueError:
+            self.db.finish(entry['id'], error='The selected model is no longer configured. Retry after selecting an available model.')
+            return
+        if task['config_hash'] != fingerprint:
             self.db.finish(entry['id'], error='Provider configuration changed since this task was created. Retry to create a new task with the current configuration.')
             return
-        settings = self.config.get()
         settings['mode'] = task['mode']
         options = task.get('options', {})
         result_key = hashlib.sha256(json.dumps([entry['fingerprint'], task['config_hash'], task['cnki_mode']], sort_keys=True).encode()).hexdigest()
         force = bool(options.get('force'))
         try:
             records, errors, model_suggestions, reused = [], [], [], False
-            cached = None if force else self.verifications.get(result_key)
-            prior, prior_task = (None, None) if force else self._previous(entry, task)
+            cached = None if force or options.get('revalidate') else self.verifications.get(result_key)
+            prior, prior_task = (None, None) if force or options.get('revalidate') else self._previous(entry, task)
             sources = options.get('sources')
             if options.get('seed_records'):
                 records = options['seed_records']
@@ -159,15 +165,23 @@ class Worker:
             by_id = {r['id']: r for r in records + manual}
             model_suggestions = [s for s in model_suggestions if all(ref in by_id for ref in s.get('evidence_ids', []))]
             records = list(by_id.values())
-            result = assess(entry, records, errors)
+            fresh_records = [record for record in records if record.get('cache_state') != 'stale']
+            model_suggestions = [item for item in model_suggestions if all(ref in {record['id'] for record in fresh_records} for ref in item.get('evidence_ids', []))]
+            result = assess(entry, fresh_records, errors)
+            result['evidence'] = records
+            if len(fresh_records) != len(records):
+                result['issues'].append('Historical source evidence was retained after failed revalidation and is not used for new corrections.')
+                if not result.get('accepted_changes') and not result.get('suggested_entry_type'):
+                    result['suggested_bibtex'] = None
             result['provider_errors'] = errors
+            result['freshness_state'] = 'stale' if any(record.get('cache_state') == 'stale' for record in records) else 'fresh'
             result['model_suggestions'] = model_suggestions
             result['calls'] = self.db.calls(task['id'], entry['id'])
             result['mode'] = task['mode']
             result['mock'] = task['mode'] == 'mock'
             result['cache_source'] = 'verification' if cached else 'previous_evidence' if prior else 'manual' if options.get('manual_only') else 'providers'
             result['checked_at'] = now()
-            result['rules_version'] = '2026-10-24.1'
+            result['rules_version'] = RULE_VERSION
             result['manual_records'] = sum(r.get('method') == 'manual' for r in records)
             # A result is no fresher than *any* supporting request, including
             # negative publication/DOI searches. Reuploading must not extend TTLs.
@@ -184,6 +198,8 @@ class Worker:
             expires = min(expiries) if not errors else time.time()
             result['expires_at'] = datetime.fromtimestamp(expires, timezone.utc).isoformat()
             result = self.config.redact(result)
+            from .library import Library
+            Library(self.db).ingest(entry, result, task)
             self.db.finish(entry['id'], result, reused=reused)
             current_task = self.db.task(task['id'])
             ttl = expires - time.time()

@@ -13,10 +13,10 @@ from urllib.parse import unquote
 
 from .bibtex import BibTeXError, render_suggestion
 
-RULE_VERSION = "2026-10-24.1"
-_FIELDS = ("title", "author", "year", "journal", "booktitle", "volume", "number", "pages", "eid", "doi", "publisher")
+RULE_VERSION = "2026-10-25.2"
+_FIELDS = ("title", "author", "year", "journal", "booktitle", "volume", "number", "pages", "eid", "doi", "publisher", "editor", "month", "address", "url", "isbn", "issn", "series", "edition", "organization", "abstract", "keywords")
 _SUPPORTED = {"article", "inproceedings", "conference", "misc", "book", "inbook", "incollection", "proceedings", "phdthesis", "mastersthesis", "techreport", "report", "unpublished", "online"}
-_VERSION_FIELDS = {"title", "author", "year", "date", "journal", "journaltitle", "booktitle", "volume", "number", "issue", "pages", "eid", "doi", "url", "eprint", "eprinttype", "archiveprefix", "primaryclass", "crossref", "publisher"}
+_VERSION_FIELDS = {"title", "author", "year", "date", "journal", "journaltitle", "booktitle", "volume", "number", "issue", "pages", "eid", "doi", "url", "eprint", "eprinttype", "archiveprefix", "primaryclass", "crossref", "publisher", "editor", "month", "address", "isbn", "issn", "series", "edition", "organization", "abstract", "keywords"}
 
 
 def normalize_doi(value: object) -> str:
@@ -145,6 +145,13 @@ def _equivalent(field: str, left: object, right: object) -> bool:
         return authors_equivalent(left, right)
     if field in {"journal", "booktitle"}:
         return _venue_equivalent(left, right)
+    if field == "month":
+        months = {name: str(index) for index, name in enumerate(("january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"), 1)}
+        months.update({name[:3]: value for name, value in list(months.items())})
+        normalize = lambda value: months.get(str(value).strip().lower(), str(value).strip().lstrip('0'))
+        return normalize(left) == normalize(right)
+    if field == "url":
+        return str(left).strip() == str(right).strip()
     if field == "pages":
         return re.sub(r"[\s\-–—]+", "-", str(left)).strip("-") == re.sub(r"[\s\-–—]+", "-", str(right)).strip("-")
     return _text(left) == _text(right)
@@ -418,14 +425,47 @@ def assess(entry: dict, records: list[dict], errors: list[dict] | None = None) -
             candidates.append(record)
 
     assessments, changes = [], {}
-    source_conflict = False
+    authoritative = [record for record in selected if record.get("provider") == "acl"
+                     and record.get("method") == "api" and record.get("provenance") == "acl_anthology_bibtex"]
+    kinds = {str(_fields(record).get("entrytype", "")).lower() for record in authoritative}
+    suggested_type = None
+    type_dependencies = []
+    if len(kinds) == 1:
+        kind = next(iter(kinds))
+        if kind in {"article", "inproceedings", "conference"} and kind != entry.get("entry_type"):
+            target_venue = "journal" if kind == "article" else "booktitle"
+            old_venue = "booktitle" if kind == "article" else "journal"
+            venues = [_fields(record).get(target_venue) for record in authoritative]
+            if all(venues) and all(_equivalent(target_venue, venues[0], value) for value in venues[1:]):
+                suggested_type = kind
+                assessments.append(_assessment("entry_type", entry.get("entry_type"), kind, "correction",
+                    "The identity-matched ACL publication record supplies this entry type; venue fields change together", authoritative))
+                type_dependencies = ["entry_type", target_venue]
+                if original.get(old_venue):
+                    changes[old_venue] = None
+                    type_dependencies.append(old_venue)
+                    assessments.append(_assessment(old_venue, original[old_venue], None, "correction",
+                        "Remove the incompatible venue field only together with the verified entry-type correction", authoritative))
+                if old_venue == "journal" and entry.get("fields", {}).get("journaltitle"):
+                    changes["journaltitle"] = None
+                    type_dependencies.append("journaltitle")
+                    assessments.append(_assessment("journaltitle", entry["fields"]["journaltitle"], None, "correction",
+                        "Remove the incompatible BibLaTeX venue alias together with the entry-type correction", authoritative))
+    source_conflict = len(kinds) > 1
     checked = set(_FIELDS[:3]) | {field for field in _FIELDS if field in original or any(_fields(record).get(field) for record in selected)}
     checked.add("doi")
     for field in _FIELDS:
         if field not in checked:
             continue
         original_value = original.get(field)  # Absent and explicitly empty remain distinct.
+        if field in changes and changes[field] is None:
+            continue
         available = [record for record in selected if _fields(record).get(field) not in (None, "")]
+        # Official publisher bibliographic fields outrank aggregator exports for
+        # the already-established same-version identity, not for title/author identity.
+        official = [record for record in authoritative if _fields(record).get(field) not in (None, "")]
+        if official and field in {"journal", "booktitle", "publisher", "editor", "month", "address", "url", "isbn", "issn", "series", "edition", "organization", "abstract", "keywords"}:
+            available = official
         if not selected:
             reason = "No uniquely established same-version record is available for this field"
             if field == "doi" and doi_conflicts:
@@ -495,7 +535,7 @@ def assess(entry: dict, records: list[dict], errors: list[dict] | None = None) -
     else:
         field_state = "consistent"
     try:
-        suggested_bibtex = render_suggestion(entry, changes)
+        suggested_bibtex = render_suggestion(entry, changes, suggested_type)
     except BibTeXError as error:
         suggested_bibtex = None
         issues.append(str(error))
@@ -504,6 +544,7 @@ def assess(entry: dict, records: list[dict], errors: list[dict] | None = None) -
         "publication_state": publication_state, "assessments": assessments, "candidates": candidates,
         "evidence": evidence, "suggested_bibtex": suggested_bibtex, "issues": list(dict.fromkeys(issues)),
         "mock": mock, "rule_version": RULE_VERSION,
+        "accepted_changes": changes, "suggested_entry_type": suggested_type, "type_dependencies": type_dependencies,
     }
     if publication_suggestion:
         result["publication_suggestion"] = publication_suggestion

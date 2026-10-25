@@ -11,6 +11,7 @@ import math
 import re
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable
@@ -143,14 +144,41 @@ class ProviderService:
         self._attempts = 0
         self._max_attempts = 24
         self._lock = threading.RLock()
-        self._secrets = tuple(_text(settings.get(p, {}).get("api_key")) for p in ("llm", "deepseek", "semantic_scholar"))
+        self._secrets = tuple(_text(settings.get(p, {}).get("api_key")) for p in ("llm", "deepseek", "semantic_scholar")) + tuple(_text(p.get("api_key")) for p in settings.get("llm_providers", []))
 
     def close(self) -> None:
         if self._owns_client:
             self.client.close()
 
     def _event(self, event: dict) -> None:
-        event = redact(event, self._secrets)
+        # Model text can itself contain encoded JSON; scrub encoded key forms
+        # before persisting, not merely when the UI later displays the record.
+        secret_forms = set(self._secrets)
+        for secret in self._secrets:
+            for ascii_only in (False, True):
+                encoded = secret
+                for _ in range(3):
+                    encoded = json.dumps(encoded, ensure_ascii=ascii_only)[1:-1]
+                    secret_forms.add(encoded)
+        def sanitize(value, depth=0):
+            if depth > 16:
+                return "[redacted: nesting limit]"
+            if isinstance(value, dict):
+                return {redact(str(key), tuple(secret_forms)): sanitize(item, depth + 1)
+                        for key, item in redact(value, tuple(secret_forms)).items()}
+            if isinstance(value, (list, tuple)):
+                return [sanitize(item, depth + 1) for item in value]
+            if isinstance(value, str) and value.lstrip().startswith(('{', '[', '"')):
+                try:
+                    decoded = json.loads(value)
+                except (ValueError, RecursionError):
+                    pass
+                else:
+                    # Decode nested JSON strings before redaction, then retain
+                    # the original string shape for normalized audit output.
+                    return json.dumps(sanitize(decoded, depth + 1), ensure_ascii=False)
+            return redact(value, tuple(secret_forms))
+        event = sanitize(event)
         event.setdefault("at", _iso(_now()))
         event.setdefault("cache_hit", False)
         event.setdefault("tokens", {})
@@ -166,6 +194,13 @@ class ProviderService:
             days = defaults[kind]
         return max(0, min(days, 3650)) * 86400
 
+    def _rate_bucket(self, provider):
+        if provider == "cnki": return "deepseek"
+        if provider == "llm":
+            config = self.settings.get("llm", {})
+            return "llm:" + config.get("provider_id", "legacy") + ":" + config.get("base_url", "")
+        return provider
+
     def _throttle(self, provider: str) -> None:
         rates = {"crossref": 5.0, "arxiv": 1 / 3, "datacite": 2.0, "doi": 2.0,
                  "deepseek": 2.0, "cnki": 2.0, "llm": 1.0}
@@ -174,7 +209,7 @@ class ProviderService:
         except (ValueError, TypeError):
             rate = 1
         rate = max(0.05, min(rate, 100))
-        bucket = "deepseek" if provider == "cnki" else provider
+        bucket = self._rate_bucket(provider)
         # Shared across entries and independent connection tests in this process.
         # Holding the short lock through sleep prevents two clients reserving the
         # same provider slot. The durable worker is deliberately serial.
@@ -226,17 +261,31 @@ class ProviderService:
         key = "request:" + _digest({"adapter": ADAPTER_VERSION, "provider": provider,
                                     "operation": operation, "url": url, "method": method,
                                     "params": params, "body": body, "text": text,
-                                    "accept": (headers or {}).get("Accept")})
+                                    "accept": (headers or {}).get("Accept"),
+                                    "request_scope": _digest({str(k).lower(): str(v) for k, v in (headers or {}).items()})})
         trace = {"provider": provider, "operation": operation, "url": url,
                  "query": params if params is not None else body or {}, "method": method}
+        stale = None
         if cache_response and not self._force and self.cache is not None:
-            cached = self.cache.get(key)
+            found = self.cache.inspect(key) if hasattr(self.cache, "inspect") else None
+            if found is None and hasattr(self.cache, "db"):
+                from .library import Library
+                found = Library(self.cache.db).response(key)
+            cached = found["value"] if found and found["state"] == "fresh" else self.cache.get(key)
             if isinstance(cached, dict) and "data" in cached:
                 self._event({**trace, "status": "cache_hit", "cache_hit": True,
                              "external_call": False, "attempt": 0, "latency_ms": 0,
                              "http_status": cached.get("http_status", 200),
                              "retrieved_at": cached.get("retrieved_at"), "expires_at": cached.get("expires_at")})
-                return redact(cached, self._secrets)
+                return redact({**cached, "cache_state": "fresh"}, self._secrets)
+            if found and isinstance(found["value"], dict) and "data" in found["value"]:
+                stale = found["value"]
+        request_headers = dict(headers or {})
+        if stale and method == "GET":
+            if stale.get("etag"):
+                request_headers["If-None-Match"] = stale["etag"]
+            elif stale.get("last_modified"):
+                request_headers["If-Modified-Since"] = stale["last_modified"]
         for attempt in range(1, 4):
             try:
                 self._throttle(provider)
@@ -261,14 +310,16 @@ class ProviderService:
                 start = time.monotonic()
 
             try:
-                options: dict[str, Any] = {"headers": headers or {}, "timeout": max(1, min(float(timeout), 120))}
+                options: dict[str, Any] = {"headers": request_headers, "timeout": max(1, min(float(timeout), 120))}
                 if params is not None:
                     options["params"] = params
                 if body is not None:
                     options["json"] = body
                 response = safe_request(self.client, method, url, on_redirect=redirected, **options)
                 status = response.status_code
-                if status == 404 and provider not in ("deepseek", "cnki", "llm"):
+                if status == 304 and stale is not None:
+                    data = stale["data"]
+                elif status == 404 and provider not in ("deepseek", "cnki", "llm"):
                     data = None
                 elif 200 <= status < 300:
                     try:
@@ -287,9 +338,15 @@ class ProviderService:
                     empty = not ET.fromstring(data).findall("{http://www.w3.org/2005/Atom}entry")
                 ttl = self._ttl("negative" if empty else kind)
                 retrieved = _now()
-                envelope = {"data": data, "retrieved_at": _iso(retrieved),
-                            "expires_at": _iso(retrieved + timedelta(seconds=ttl)), "http_status": status}
-                self._event({**trace, "status": "no_results" if empty else "ok", "attempt": attempt,
+                unchanged = stale is not None and _digest(data) == _digest(stale["data"])
+                envelope = {"data": data, "retrieved_at": stale.get("retrieved_at", _iso(retrieved)) if unchanged else _iso(retrieved),
+                            "last_checked_at": _iso(retrieved), "cache_state": "fresh",
+                            "expires_at": _iso(retrieved + timedelta(seconds=ttl)),
+                            "http_status": stale.get("http_status", 200) if status == 304 else status,
+                            "etag": response.headers.get("ETag") or ((stale or {}).get("etag") if status == 304 else None),
+                            "last_modified": response.headers.get("Last-Modified") or ((stale or {}).get("last_modified") if status == 304 else None)}
+                self._event({**trace, "status": "revalidated" if unchanged else "changed" if stale else "no_results" if empty else "ok", "attempt": attempt,
+                             "revalidation": "not_modified" if status == 304 else "unchanged" if unchanged else "changed" if stale else None,
                              "external_call": True, "http_status": status,
                              "retrieved_at": envelope["retrieved_at"], "expires_at": envelope["expires_at"],
                              "latency_ms": round((time.monotonic() - start) * 1000, 2),
@@ -299,6 +356,9 @@ class ProviderService:
                 envelope = redact(envelope, self._secrets)
                 if cache_response and self.cache is not None:
                     self.cache.put(key, envelope, ttl)
+                    if hasattr(self.cache, "db"):
+                        from .library import Library
+                        Library(self.cache.db).archive_response(key, envelope)
                 return envelope
             except ProviderError as exc:
                 failure = exc
@@ -316,12 +376,22 @@ class ProviderService:
                 failure.retry_after_seconds = retry_delay
             if retryable and response is not None and response.headers.get("Retry-After"):
                 with _RATE_LOCK:
-                    bucket = "deepseek" if provider == "cnki" else provider
+                    bucket = self._rate_bucket(provider)
                     _NOT_BEFORE[bucket] = max(_NOT_BEFORE.get(bucket, 0), time.monotonic() + retry_delay)
             self._event({**trace, "status": "error", "attempt": attempt, "external_call": attempt_state["external_call"],
                          "http_status": failure.status, "latency_ms": round((time.monotonic() - start) * 1000, 2),
                          "error": failure.as_dict()})
             if not retryable or attempt == 3 or retry_delay > 10:
+                if stale is not None and failure.kind not in ("unsafe_url", "configuration"):
+                    retained = {**redact(stale, self._secrets), "cache_state": "stale",
+                                "revalidation_error": failure.as_dict()}
+                    if not hasattr(self, "_partial_errors"):
+                        self._partial_errors = []
+                    self._partial_errors.append({**failure.as_dict(), "retained_history": True})
+                    self._event({**trace, "status": "stale_retained", "cache_hit": True,
+                                 "external_call": False, "attempt": 0, "latency_ms": 0,
+                                 "expires_at": stale.get("expires_at"), "error": failure.as_dict()})
+                    return retained
                 raise failure
             self.sleep(retry_delay)
         raise ProviderError(provider, "network_error", "Request could not be completed")
@@ -379,7 +449,12 @@ class ProviderService:
                   "fields": fields, "raw": redact(raw, self._secrets), "method": method,
                   "provenance": provenance or provider, "version": version}
         record.update({k: v for k, v in related.items() if v})
-        return redact(record, self._secrets)
+        record.update({name: envelope[name] for name in ("last_checked_at", "cache_state", "revalidation_error") if name in envelope})
+        record = redact(record, self._secrets)
+        if hasattr(self.cache, "db"):
+            from .library import Library
+            Library(self.cache.db).archive_record(record, self.settings.get("mode", "live"))
+        return record
 
     def _crossref_record(self, raw: dict, envelope: dict, provider: str = "crossref") -> dict:
         kind = _text(raw.get("type"))
@@ -678,19 +753,83 @@ class ProviderService:
                        "The value must equal that field in a cited record. For extraction from page content, supply an exact "
                        "quotation containing the entire value. When uncertain return an empty suggestions array."
         }
-        envelope = self._request("llm", "grounded_suggestions", base + "/chat/completions", method="POST",
-                                 body={"model": config["model"], "messages": [prompt, {"role": "user", "content": json.dumps({"entry": minimal_entry, "evidence": evidence}, ensure_ascii=False)}],
-                                       "response_format": {"type": "json_object"},
-                                       "max_tokens": max(64, min(int(config.get("max_output_tokens", 1500)), 8192))},
-                                 headers={"Authorization": "Bearer " + config["api_key"]},
-                                 timeout=config.get("timeout", 45), kind="search", cache_response=False)
-        try:
-            data = envelope["data"]
-            content = data["choices"][0]["message"]["content"]
-            structured = json.loads(content)
-            return self._validate_suggestions(structured, records)
-        except (KeyError, IndexError, TypeError, ValueError):
-            raise ProviderError("llm", "invalid_model_output", "Model output failed schema or evidence validation; no suggestions were accepted") from None
+        messages = [prompt, {"role": "user", "content": json.dumps({"entry": minimal_entry, "evidence": evidence}, ensure_ascii=False)}]
+        model_identity = {key: config.get(key) for key in ("provider_id", "client_type", "base_url", "model", "temperature", "max_output_tokens")}
+        model_identity["credential_hash"] = _digest(config.get("api_key", ""))
+        if any(row.get("cache_state") == "stale" for row in records):
+            return []  # Failed source confirmation must not trigger a paid reinterpretation.
+        key = "model-result:" + _digest([ADAPTER_VERSION, "grounded-prompt-v1", model_identity, messages])
+        if not self._force and self.cache is not None:
+            # A content-addressed model judgment is reusable while its exact
+            # prompt/evidence/config remain identical, regardless of source TTL.
+            found = self.cache.inspect(key) if hasattr(self.cache, "inspect") else None
+            cached = found["value"] if found else self.cache.get(key)
+            if isinstance(cached, dict) and "suggestions" in cached:
+                suggestions = self._validate_suggestions(cached, records)
+                self._event({"provider": "llm", "provider_id": config.get("provider_id"),
+                             "model_config_id": config.get("model_config_id"), "model": config.get("model"),
+                             "operation": "grounded_suggestions", "status": "cache_hit", "cache_hit": True,
+                             "external_call": False, "attempt": 0, "latency_ms": 0,
+                             "cost": {"status": "not_applicable", "amount": 0, "currency": "USD"}})
+                return suggestions
+        suggestions = self._model_request(config, messages, records)
+        if self.cache is not None:
+            stored = [{name: value for name, value in item.items() if name not in ("method", "verified")} for item in suggestions]
+            self.cache.put(key, redact({"suggestions": stored}, self._secrets), 365 * 86400)
+        return suggestions
+
+    def _model_request(self, config, messages, records):
+        from .llm import LLMCallError, estimate_cost, invoke
+        trace = {"provider": "llm", "provider_id": config.get("provider_id", "legacy"),
+                 "model_config_id": config.get("model_config_id", "legacy"), "model": config["model"],
+                 "client_type": config.get("client_type", "openai-chat"), "url": config["base_url"],
+                 "operation": "grounded_suggestions", "trace_id": uuid.uuid4().hex,
+                 "query": {"messages": messages}, "method": "POST"}
+        attempts = 1 + int(config.get("max_retries", 2))
+        for attempt in range(1, attempts + 1):
+            try:
+                self._throttle("llm")
+                self._consume_budget("llm")
+            except ProviderError as error:
+                self._event({**trace, "status": "error", "external_call": False, "attempt": 0,
+                             "error": error.as_dict(), "cost": {"status": "not_applicable", "amount": 0, "currency": "USD"}})
+                raise
+            start, details, retry_after = time.monotonic(), {}, None
+            try:
+                details = invoke(config, messages, self.client)
+                value = details["content"]
+                structured = value if isinstance(value, dict) else json.loads(value, parse_constant=_reject_json_constant)
+                suggestions = self._validate_suggestions(structured, records)
+                self._event({**trace, **details, "status": "ok", "attempt": attempt, "external_call": details.get("external_call", False),
+                             "tokens": details.get("usage_metadata") or {},
+                             "validation": {"status": "accepted", "suggestions": len(suggestions)},
+                             "cost": (estimate_cost(config, details.get("usage_metadata")) if details.get("external_call") else
+                                      {"status": "not_applicable", "amount": 0, "currency": "USD"}),
+                             "latency_ms": round((time.monotonic() - start) * 1000, 2)})
+                return suggestions
+            except LLMCallError as error:
+                details, retry_after = error.details, error.retry_after
+                failure = ProviderError("llm", error.kind, "Model call failed (" + error.kind + ")", error.status)
+            except (ValueError, TypeError, KeyError) as error:
+                failure = ProviderError("llm", "invalid_model_output", "Model output failed schema or evidence validation; no suggestions were accepted")
+                details["validation"] = {"status": "rejected", "reason": str(error)[:300]}
+            response = httpx.Response(failure.status or 500, headers={"Retry-After": retry_after}) if retry_after else None
+            retryable = failure.kind in ("timeout", "network_error", "rate_limited", "server_error")
+            delay = self._retry_delay(response, attempt) if retryable else 0
+            if delay > 10: failure.retry_after_seconds = delay
+            if retryable and retry_after:
+                with _RATE_LOCK:
+                    bucket = self._rate_bucket("llm")
+                    _NOT_BEFORE[bucket] = max(_NOT_BEFORE.get(bucket, 0), time.monotonic() + delay)
+            self._event({**trace, **details, "status": "error", "attempt": attempt, "external_call": details.get("external_call", False),
+                         "tokens": details.get("usage_metadata") or {}, "error": failure.as_dict(),
+                         "cost": (estimate_cost(config, details.get("usage_metadata")) if details.get("external_call") else
+                                      {"status": "not_applicable", "amount": 0, "currency": "USD"}),
+                         "latency_ms": round((time.monotonic() - start) * 1000, 2)})
+            if not retryable or attempt == attempts or delay > 10:
+                raise failure
+            self.sleep(delay)
+        raise ProviderError("llm", "network_error", "Model request could not be completed")
 
     @staticmethod
     def _validate_suggestions(value: Any, records: list[dict]) -> list[dict]:
@@ -763,6 +902,10 @@ class ProviderService:
                 except (ValueError, TypeError, KeyError, AttributeError):
                     errors.append({"provider": provider, "kind": "invalid_response", "code": "invalid_response", "message": "Provider response could not be interpreted safely"})
                 return []
+
+            if enabled("acl"):
+                from .acl import collect_acl
+                run("acl", lambda: collect_acl(fields, self._request, self._record))
 
             crossref = []
             if enabled("crossref"):

@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
+import { AuditDialog } from "./AuditDialog";
+import { LibraryDialog } from "./LibraryDialog";
+import { BibExportDialog } from "./BibExportDialog";
 import { EntryDetail, type Entry } from "./EntryDetail";
 import {
   ConfirmDialog,
@@ -178,6 +181,9 @@ type DialogState =
   | { kind: "upload"; parentTaskId?: string; navigation: number }
   | { kind: "manual"; entryId: string; navigation: number }
   | { kind: "settings" }
+  | { kind: "audit"; taskId?: string }
+  | { kind: "library" }
+  | { kind: "export"; taskId: string }
   | null;
 type Confirmation = {
   title: string;
@@ -469,7 +475,7 @@ export default function App() {
       } catch {
         /* Write already succeeded. */
       }
-      notify(response.unchanged ? "没有需要刷新的过期结果。" : message);
+      notify(response.unchanged ? "没有需要复核的到期结果。" : message);
     } catch (error) {
       notify(issueText(error instanceof Error ? error.message : error), true);
     } finally {
@@ -497,16 +503,16 @@ export default function App() {
         "已创建重试任务",
       ],
       "refresh-stale": [
-        "刷新过期结果",
+        "按需复核到期结果",
         captured.mode === "live"
-          ? "仅复查证据已过期的条目。将重新查询相关在线来源，可能产生费用；历史任务和旧证据保留。"
-          : "仅刷新过期的模拟结果，不发起外部请求。历史任务和旧证据保留。",
-        "刷新过期结果",
-        "已提交过期结果刷新",
+          ? "仅复核到期来源，仍新鲜的证据继续复用。在线请求可能产生费用；历史任务和旧证据保留。"
+          : "仅复核到期的模拟结果，不发起外部请求。历史任务和旧证据保留。",
+        "按需复核到期结果",
+        "已提交到期复核",
       ],
       delete: [
         "删除这次检查？",
-        `将删除“${captured.filename}”的任务记录、上传快照及其检查结果，此操作不可撤销。本地原文件和其他任务不受影响。`,
+        `将删除“${captured.filename}”的任务记录、上传快照及其检查结果，此操作不可撤销。本地原文件和其他任务不受影响。文献库与来源快照、调用审计与费用记录（含已记录的请求和响应文本）仍保留。`,
         "删除检查",
         "检查记录已删除",
       ],
@@ -610,6 +616,20 @@ export default function App() {
               <p className="sidebar-empty">暂无检查记录</p>
             )}
           </nav>
+          <Button
+            className="quiet audit-navigation"
+            icon="document"
+            onClick={() => setDialog({ kind: "library" })}
+          >
+            文献库
+          </Button>
+          <Button
+            className="quiet audit-navigation"
+            icon="document"
+            onClick={() => setDialog({ kind: "audit" })}
+          >
+            调用审计
+          </Button>
           <div className="sidebar-footer">
             <span className="local-indicator">
               <span />
@@ -644,6 +664,22 @@ export default function App() {
             </div>
             {task && (
               <div className="header-actions">
+                {!isRunning(task) && (
+                  <Button
+                    icon="download"
+                    onClick={() =>
+                      setDialog({ kind: "export", taskId: task.id })
+                    }
+                  >
+                    整库导出
+                  </Button>
+                )}
+                <Button
+                  className="quiet"
+                  onClick={() => setDialog({ kind: "audit", taskId: task.id })}
+                >
+                  调用与费用
+                </Button>
                 <a
                   className="button"
                   href={`/api/tasks/${encodeURIComponent(task.id)}/source`}
@@ -678,7 +714,7 @@ export default function App() {
                       icon="refresh"
                       onClick={() => void taskAction("refresh-stale")}
                     >
-                      刷新过期
+                      按需复核
                     </Button>
                     {!!task.failed && (
                       <Button
@@ -887,6 +923,30 @@ export default function App() {
           onClose={() => setDialog(null)}
           onCreated={(id) => onCreated(id, dialog.navigation, true)}
         />
+      )}
+      {dialog?.kind === "export" && (
+        <BibExportDialog
+          taskId={dialog.taskId}
+          onClose={() => setDialog(null)}
+          confirm={confirm}
+          onInspect={(id) => {
+            setDialog(null);
+            setSelected(id);
+            setInitialTab("evidence");
+          }}
+        />
+      )}
+      {dialog?.kind === "library" && (
+        <LibraryDialog
+          onClose={() => setDialog(null)}
+          onOpenTask={(id) => {
+            setDialog(null);
+            selectTask(id);
+          }}
+        />
+      )}
+      {dialog?.kind === "audit" && (
+        <AuditDialog taskId={dialog.taskId} onClose={() => setDialog(null)} />
       )}
       {dialog?.kind === "settings" && (
         <SettingsDialog

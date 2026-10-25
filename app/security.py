@@ -104,7 +104,11 @@ class PublicNetworkTransport(httpx.BaseTransport):
         self._lock = threading.Lock()
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
-        checked = validate_url(str(request.url))
+        try:
+            checked = validate_url(str(request.url))
+        except SecurityError as error:
+            error.request_sent = False
+            raise
         headers = request.headers.copy()
         headers["Host"] = request.url.netloc.decode("ascii")
         extensions = dict(request.extensions)
@@ -182,7 +186,10 @@ def safe_request(client: httpx.Client, method: str, url: str, *, max_bytes: int 
                 if total > max_bytes:
                     raise SecurityError("Response exceeds the allowed size")
                 chunks.append(chunk)
-            return httpx.Response(response.status_code, headers=response.headers,
+            normalized_headers = dict(response.headers)
+            normalized_headers.pop("content-encoding", None)
+            normalized_headers.pop("content-length", None)
+            return httpx.Response(response.status_code, headers=normalized_headers,
                                   content=b"".join(chunks), request=response.request,
                                   extensions=response.extensions)
     raise SecurityError("Too many redirects")
@@ -194,7 +201,7 @@ _SECRET_NAME = re.compile(r"^(?:api[_-]?key|authorization|password|secret|token|
 def redact(value: Any, secrets: tuple[str, ...] | list[str] = ()) -> Any:
     """Sanitize reports without exposing raw exception messages or credentials."""
     if isinstance(value, dict):
-        return {str(k): "[redacted]" if _SECRET_NAME.match(str(k)) else redact(v, secrets)
+        return {redact(str(k), secrets): "[redacted]" if _SECRET_NAME.match(str(k)) else redact(v, secrets)
                 for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [redact(v, secrets) for v in value]

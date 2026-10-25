@@ -191,9 +191,10 @@ describe("upload and manual entry", () => {
       target: { files: [new File(["@misc{a}"], "live.bib")] },
     });
     fireEvent.click(screen.getByRole("radio", { name: /在线核验/ }));
+    await screen.findByLabelText("核验模型");
     fireEvent.click(screen.getByRole("button", { name: "开始在线核验" }));
-    await waitFor(() => expect(request).toHaveBeenCalledTimes(1));
-    expect((request.mock.calls[0][1]?.body as FormData).get("mode")).toBe(
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2));
+    expect((request.mock.calls[1][1]?.body as FormData).get("mode")).toBe(
       "live",
     );
   });

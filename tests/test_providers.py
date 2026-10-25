@@ -380,7 +380,8 @@ class ProviderTests(unittest.TestCase):
         seen = []
         def handler(req):
             seen.append(req)
-            return httpx.Response(200, json={"choices": [{"message": {"content": '{"suggestions": []}'}}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+            from test_mmsp import chat_reply
+            return httpx.Response(200, headers={'content-type':'text/event-stream'}, content=chat_reply())
         service = self.service(handler, {"llm": {"api_key": "model-secret", "base_url": "https://example.org/v1", "model": "test-model"}})
         result = service.test_connection("llm")
         self.assertTrue(result["ok"])

@@ -7,6 +7,15 @@ import {
   type ReactNode,
 } from "react";
 import { api } from "./api";
+import {
+  ModelSettings,
+  emptyModels,
+  modelPayload,
+  modelLabel,
+  type ModelConfiguration,
+  type ModelConfigurationSet,
+  type ModelCatalog,
+} from "./ModelSettings";
 
 type Created = (id: string) => void | Promise<void>;
 type Confirm = (
@@ -164,6 +173,41 @@ export function UploadDialog({
 }) {
   const [file, setFile] = useState<File | null>(null);
   const [mode, setMode] = useState("mock");
+  const [modelSettings, setModelSettings] =
+    useState<ModelConfigurationSet | null>(null);
+  const [modelId, setModelId] = useState("");
+  const [modelsError, setModelsError] = useState("");
+  const [modelsReload, setModelsReload] = useState(0);
+  useEffect(() => {
+    if (mode !== "live") return;
+    let active = true;
+    setModelSettings(null);
+    setModelsError("");
+    setModelId("");
+    api<Record<string, unknown>>("/api/settings")
+      .then((result) => {
+        if (!active) return;
+        setModelSettings({
+          llm_providers: Array.isArray(result.llm_providers)
+            ? (result.llm_providers as ModelConfigurationSet["llm_providers"])
+            : [],
+          llm_models: Array.isArray(result.llm_models)
+            ? (result.llm_models as ModelConfiguration[])
+            : [],
+          default_model_id:
+            typeof result.default_model_id === "string"
+              ? result.default_model_id
+              : "",
+        });
+      })
+      .catch((failure) => {
+        if (active) setModelsError(errorText(failure));
+      });
+    return () => {
+      active = false;
+    };
+  }, [mode, modelsReload]);
+
   const [cnki, setCnki] = useState("off");
   const [linkParent, setLinkParent] = useState(!!parentTaskId);
   const [dragging, setDragging] = useState(false);
@@ -172,7 +216,7 @@ export function UploadDialog({
   const pending = useRef(false);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (pending.current) return;
+    if (pending.current || (mode === "live" && !modelSettings)) return;
     if (!file) {
       setError("请选择 .bib 文件。");
       return;
@@ -189,6 +233,7 @@ export function UploadDialog({
     data.set("file", file);
     data.set("mode", mode);
     data.set("cnki_mode", cnki);
+    if (mode === "live" && modelId) data.set("model_id", modelId);
     if (parentTaskId && linkParent) data.set("parent_id", parentTaskId);
     pending.current = true;
     setBusy(true);
@@ -276,6 +321,57 @@ export function UploadDialog({
             </span>
           </label>
         </fieldset>
+        {mode === "live" && (
+          <div className="upload-model">
+            {modelSettings ? (
+              <label>
+                核验模型
+                <select
+                  value={modelId}
+                  onChange={(event) => setModelId(event.target.value)}
+                  disabled={busy}
+                >
+                  <option value="">
+                    默认：
+                    {modelSettings.llm_models.find(
+                      (model) =>
+                        model.id === modelSettings.default_model_id &&
+                        !!model.model.trim(),
+                    )
+                      ? modelLabel(
+                          modelSettings.llm_models.find(
+                            (model) =>
+                              model.id === modelSettings.default_model_id,
+                          )!,
+                          modelSettings.llm_providers,
+                        )
+                      : "不使用大模型"}
+                  </option>
+                  {modelSettings.llm_models
+                    .filter((model) => !!model.model.trim())
+                    .map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {modelLabel(model, modelSettings.llm_providers)}
+                      </option>
+                    ))}
+                </select>
+              </label>
+            ) : modelsError ? (
+              <div className="inline-error" role="alert">
+                {modelsError}
+                <button
+                  type="button"
+                  className="button small"
+                  onClick={() => setModelsReload((value) => value + 1)}
+                >
+                  重新加载模型
+                </button>
+              </div>
+            ) : (
+              <p role="status">加载模型配置中…</p>
+            )}
+          </div>
+        )}
         <label className="field-label" htmlFor="cnki-mode">
           CNKI 公开网页补充检索
         </label>
@@ -312,7 +408,11 @@ export function UploadDialog({
           >
             取消
           </button>
-          <button className="button primary" type="submit" disabled={busy}>
+          <button
+            className="button primary"
+            type="submit"
+            disabled={busy || (mode === "live" && !modelSettings)}
+          >
             {busy
               ? "创建中…"
               : mode === "live"
@@ -497,10 +597,12 @@ export function ManualDialog({
 }
 
 type SettingGroup = Record<string, string | number | boolean | null>;
-type Settings = Record<string, SettingGroup | string>;
+type Settings = Record<string, unknown>;
 function settingGroup(settings: Settings | null, name: string): SettingGroup {
   const group = settings?.[name];
-  return group && typeof group === "object" ? group : {};
+  return group && typeof group === "object" && !Array.isArray(group)
+    ? (group as SettingGroup)
+    : {};
 }
 const editableFields = [
   "llm.base_url",
@@ -531,6 +633,12 @@ export function SettingsDialog({
   confirm: Confirm;
 }) {
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [models, setModels] = useState<ModelConfigurationSet>(emptyModels);
+  const [savedModels, setSavedModels] =
+    useState<ModelConfigurationSet>(emptyModels);
+  const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
+  const hasProviders = Array.isArray(settings?.llm_providers);
+
   const [values, setValues] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -544,6 +652,22 @@ export function SettingsDialog({
   function applySettings(result: Settings) {
     if (!mounted.current) return;
     setSettings(result);
+    if (Array.isArray(result.llm_providers)) {
+      const configured: ModelConfigurationSet = {
+        llm_providers: (
+          result.llm_providers as ModelConfigurationSet["llm_providers"]
+        ).map((provider) => ({ ...provider, api_key: "" })),
+        llm_models: Array.isArray(result.llm_models)
+          ? (result.llm_models as ModelConfiguration[])
+          : [],
+        default_model_id:
+          typeof result.default_model_id === "string"
+            ? result.default_model_id
+            : "",
+      };
+      setModels(configured);
+      setSavedModels(configured);
+    }
     const next: Record<string, string> = {};
     for (const field of editableFields) {
       const [group, name] = field.split(".");
@@ -557,7 +681,18 @@ export function SettingsDialog({
     let active = true;
     api<Settings>("/api/settings")
       .then((result) => {
-        if (active) applySettings(result);
+        if (active) {
+          applySettings(result);
+          if (Array.isArray(result.llm_providers)) {
+            void api<ModelCatalog>("/api/models/catalog")
+              .then((value) => {
+                if (active && Array.isArray(value.models)) setCatalog(value);
+              })
+              .catch(() => {
+                /* Unknown prices remain explicitly unknown. */
+              });
+          }
+        }
       })
       .catch((failure) => {
         if (active) setError(errorText(failure));
@@ -589,14 +724,17 @@ export function SettingsDialog({
     await run(async () => {
       const payload: SettingPayload = {};
       for (const [key, value] of Object.entries(values)) {
-        if (!value.trim()) continue;
+        if (!value.trim() || (hasProviders && key.startsWith("llm."))) continue;
         const [group, name] = key.split(".");
         (payload[group] ??= {})[name] =
           ["budget", "cache"].includes(group) || name === "rate_per_second"
             ? Number(value)
             : value.trim();
       }
-      await api("/api/settings", { method: "PUT", body: payload });
+      await api("/api/settings", {
+        method: "PUT",
+        body: { ...payload, ...(hasProviders ? modelPayload(models) : {}) },
+      });
       // Never retain typed secrets after a successful save, including if the reload fails.
       if (mounted.current)
         setValues((current) =>
@@ -606,6 +744,14 @@ export function SettingsDialog({
             ),
           ),
         );
+      if (mounted.current)
+        setModels((current) => ({
+          ...current,
+          llm_providers: current.llm_providers.map((provider) => ({
+            ...provider,
+            api_key: "",
+          })),
+        }));
       notify("设置已保存");
       applySettings(await api<Settings>("/api/settings"));
     });
@@ -688,6 +834,45 @@ export function SettingsDialog({
           setTests((current) => ({
             ...current,
             [provider]: { text: errorText(failure), ok: false },
+          }));
+      }
+    });
+  }
+  async function testModel(model: ModelConfiguration) {
+    if (
+      !(await confirm(
+        `测试 ${model.name || model.model} 连接`,
+        "使用已保存的配置发起真实模型请求，可能计费。结果和费用将记录到调用审计。",
+        "开始测试",
+      ))
+    )
+      return;
+    await run(async () => {
+      setTests((current) => ({ ...current, [model.id]: { text: "测试中…" } }));
+      try {
+        const result = await api<{
+          ok?: boolean;
+          message?: string;
+          status?: string;
+        }>(`/api/settings/test/model/${encodeURIComponent(model.id)}`, {
+          method: "POST",
+        });
+        if (mounted.current)
+          setTests((current) => ({
+            ...current,
+            [model.id]: {
+              text:
+                result.message ||
+                result.status ||
+                (result.ok ? "连接成功" : "测试失败"),
+              ok: !!result.ok,
+            },
+          }));
+      } catch (failure) {
+        if (mounted.current)
+          setTests((current) => ({
+            ...current,
+            [model.id]: { text: errorText(failure), ok: false },
           }));
       }
     });
@@ -780,25 +965,38 @@ export function SettingsDialog({
             密钥仅保存在本机后端。留空保留已有密钥。
           </p>
           {loading && <p role="status">加载设置中…</p>}
-          <section className="provider-settings">
-            <div className="section-heading">
-              <h3>大模型</h3>
-              {keyBadge("llm")}
-            </div>
-            {field("llm.base_url", "Base URL", {
-              type: "url",
-              placeholder: "https://api.example.com/v1",
-            })}
-            <div className="form-columns">
-              {field("llm.model", "模型", { placeholder: "模型名称" })}
-              {field("llm.api_key", "API key", {
-                type: "password",
-                placeholder: "输入新密钥",
+          {hasProviders ? (
+            <ModelSettings
+              value={models}
+              saved={savedModels}
+              catalog={catalog}
+              disabled={loading || busy}
+              onChange={setModels}
+              onTest={(model) => void testModel(model)}
+              testResults={tests}
+              confirm={confirm}
+            />
+          ) : (
+            <section className="provider-settings">
+              <div className="section-heading">
+                <h3>大模型</h3>
+                {keyBadge("llm")}
+              </div>
+              {field("llm.base_url", "Base URL", {
+                type: "url",
+                placeholder: "https://api.example.com/v1",
               })}
-            </div>
-            {testControl("llm", "测试大模型连接")}
-            {removeControl("llm")}
-          </section>
+              <div className="form-columns">
+                {field("llm.model", "模型", { placeholder: "模型名称" })}
+                {field("llm.api_key", "API key", {
+                  type: "password",
+                  placeholder: "输入新密钥",
+                })}
+              </div>
+              {testControl("llm", "测试大模型连接")}
+              {removeControl("llm")}
+            </section>
+          )}
           <section className="provider-settings">
             <div className="section-heading">
               <h3>DeepSeek Search / Fetch</h3>
@@ -851,7 +1049,7 @@ export function SettingsDialog({
                 step: 1,
               })}
             </div>
-            <h3>缓存有效期（天）</h3>
+            <h3>建议复核周期（天）</h3>
             <div className="form-columns three">
               {field("cache.metadata_days", "元数据", {
                 type: "number",

@@ -158,3 +158,29 @@ test("formal publication and unverified model leads stay separate from current s
   expect(screen.getByText("模型证据线索 · 待人工核对")).toBeDefined();
   expect(screen.getByText(/未作为已核验修正/)).toBeDefined();
 });
+
+test("retained stale evidence is never presented as newly online verified", () => {
+  const entry: Entry = {
+    ...fallback,
+    result: {
+      ...fallback.result,
+      evidence: [
+        {
+          id: "stale",
+          provider: "ACL",
+          method: "api",
+          cache_state: "stale",
+          revalidation_error: "timeout",
+          last_checked_at: "2026-01-01T00:00:00Z",
+          retrieved_at: "2025-01-01T00:00:00Z",
+        },
+      ],
+    },
+  };
+  render(
+    <EntryDetail {...props} mode="live" entry={entry} initialTab="evidence" />,
+  );
+  expect(screen.getByText("历史证据 · 复核失败")).toBeDefined();
+  expect(screen.queryByText("在线获取")).toBeNull();
+  expect(screen.getByText(/最近复核/)).toBeDefined();
+});

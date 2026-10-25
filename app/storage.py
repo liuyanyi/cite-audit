@@ -4,6 +4,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
+from decimal import Decimal
 from pathlib import Path
 import sqlite3
 import time
@@ -21,8 +23,30 @@ class Database:
         self.path = self.directory / 'cite-audit.sqlite3'
         with self.connect() as conn:
             conn.execute('PRAGMA journal_mode=WAL')
-            schema = Path(__file__).resolve().parent / 'migrations' / '001_init.sql'
-            conn.executescript(schema.read_text())
+            migrations = sorted((int(schema.name.split('_', 1)[0]), schema)
+                                for schema in (Path(__file__).resolve().parent / 'migrations').glob('*.sql'))
+            versions = [version for version, _ in migrations]
+            if not versions or versions != list(range(1, len(versions) + 1)):
+                raise ValueError('Database migrations must have unique contiguous versions starting at 1')
+            if conn.execute('PRAGMA user_version').fetchone()[0] > versions[-1]:
+                raise ValueError('Database schema is newer than this application; upgrade the application')
+            for version, schema in migrations:
+                # Hold the write lock while checking the version as two app
+                # processes may start against the same local database.
+                conn.execute('BEGIN IMMEDIATE')
+                if version <= conn.execute('PRAGMA user_version').fetchone()[0]:
+                    conn.commit()
+                    continue
+                statement = ''
+                for line in schema.read_text(encoding='utf-8').splitlines(keepends=True):
+                    statement += line
+                    if sqlite3.complete_statement(statement):
+                        conn.execute(statement)
+                        statement = ''
+                if statement.strip():
+                    conn.execute(statement)
+                conn.execute(f'PRAGMA user_version={version}')
+                conn.commit()
         self.path.chmod(0o600)
 
     @contextmanager
@@ -65,6 +89,7 @@ class Database:
         task['cache_hits'] = sum(c['cache_hit'] for c in calls) + sum(e['reused'] for e in entries)
         task['api_calls'] = sum(bool(json.loads(c['payload']).get('external_call')) for c in calls)
         task['mock'] = task['mode'] == 'mock'
+        task['cost_summary'] = self.cost_summary([json.loads(c['payload']) for c in calls])
         return task
 
     def tasks(self):
@@ -148,7 +173,9 @@ class Database:
 
     def add_call(self, task_id, entry_id, payload):
         with self.connect() as conn:
-            conn.execute('INSERT INTO provider_calls(task_id,entry_id,created_at,cache_hit,payload) VALUES(?,?,?,?,?)', (task_id, entry_id, now(), int(bool(payload.get('cache_hit'))), encode(payload)))
+            created = now()
+            call = conn.execute('INSERT INTO provider_calls(task_id,entry_id,created_at,cache_hit,payload) VALUES(?,?,?,?,?)', (task_id, entry_id, created, int(bool(payload.get('cache_hit'))), encode(payload)))
+            conn.execute('INSERT INTO audit_calls(source_call_id,task_id,entry_id,provider_id,created_at,payload) VALUES(?,?,?,?,?,?)', (call.lastrowid, task_id, entry_id, payload.get('provider_id'), created, encode(payload)))
 
     def calls(self, task_id, entry_id=None):
         with self.connect() as conn:
@@ -156,6 +183,45 @@ class Database:
             args = [task_id]
             if entry_id: sql += ' AND entry_id=?'; args.append(entry_id)
             return [json.loads(r[0]) for r in conn.execute(sql + ' ORDER BY id', args)]
+
+    def add_audit_call(self, payload, task_id=None, entry_id=None):
+        """Persist standalone attempts, including explicit connection tests."""
+        with self.connect() as conn:
+            conn.execute('INSERT INTO audit_calls(task_id,entry_id,provider_id,created_at,payload) VALUES(?,?,?,?,?)',
+                         (task_id, entry_id, payload.get('provider_id'), now(), encode(payload)))
+
+    @staticmethod
+    def cost_summary(payloads):
+        totals, unknown, calls = {}, 0, 0
+        for payload in payloads:
+            if not payload.get('external_call'): continue
+            calls += 1
+            cost = payload.get('cost') or {}
+            if cost.get('status') == 'not_applicable': continue
+            amount, currency = cost.get('amount'), cost.get('currency')
+            if cost.get('status') == 'estimated' and isinstance(amount, (int, float)) and not isinstance(amount, bool) and math.isfinite(amount) and amount >= 0 and isinstance(currency, str) and currency:
+                totals[currency] = totals.get(currency, Decimal('0')) + Decimal(str(amount))
+            else:
+                unknown += 1
+        return {'estimated_costs': [{'currency': currency, 'amount': float(amount)} for currency, amount in sorted(totals.items())],
+                'unknown_cost_calls': unknown, 'total_calls': calls}
+
+    def audit(self, task_id=None, entry_id=None, provider_id=None, limit=100, offset=0):
+        clauses, arguments = [], []
+        for column, value in [('task_id', task_id), ('entry_id', entry_id), ('provider_id', provider_id)]:
+            if value:
+                clauses.append(column + '=?'); arguments.append(value)
+        where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
+        with self.connect() as conn:
+            total = conn.execute('SELECT count(*) FROM audit_calls' + where, arguments).fetchone()[0]
+            payloads = [json.loads(row[0]) for row in conn.execute('SELECT payload FROM audit_calls' + where, arguments)]
+            rows = conn.execute('SELECT * FROM audit_calls' + where + ' ORDER BY id DESC LIMIT ? OFFSET ?', [*arguments, limit, offset]).fetchall()
+        calls = []
+        for row in rows:
+            call = json.loads(row['payload'])
+            call.update({key: row[key] for key in ('id', 'task_id', 'entry_id', 'provider_id', 'created_at')})
+            calls.append(call)
+        return {'calls': calls, 'total': total, 'summary': self.cost_summary(payloads)}
 
     def previous_entries(self, entry, parent_id=None):
         with self.connect() as conn:
@@ -193,10 +259,18 @@ class PersistentCache:
         self.db, self.table = db, table
         self.column = 'value' if table == 'query_cache' else 'result'
 
-    def get(self, key):
+    def inspect(self, key):
+        """Return retained content and freshness separately; expiry never deletes it."""
         with self.db.connect() as conn:
             row = conn.execute(f'SELECT {self.column},expires_at FROM {self.table} WHERE key=?', (key,)).fetchone()
-            return json.loads(row[0]) if row and row[1] > time.time() else None
+            if not row:
+                return None
+            return {'value': json.loads(row[0]), 'state': 'fresh' if row[1] > time.time() else 'stale',
+                    'expires_at': row[1]}
+
+    def get(self, key):
+        found = self.inspect(key)
+        return found['value'] if found and found['state'] == 'fresh' else None
 
     def put(self, key, value, ttl):
         with self.db.connect() as conn:
@@ -206,4 +280,7 @@ class PersistentCache:
         with self.db.connect() as conn:
             count = conn.execute(f'SELECT count(*) FROM {self.table}').fetchone()[0]
             conn.execute(f'DELETE FROM {self.table}')
-            return count
+        if self.table == 'query_cache':
+            from .library import Library
+            Library(self.db).invalidate_responses()
+        return count

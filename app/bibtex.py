@@ -305,7 +305,7 @@ def parse_bibtex(text: str) -> dict:
             local_issues.append("Missing or invalid citation key")
         field_tokens, field_issues = _fields(body[split + 1:])
         entry = {"citation_key": key, "entry_type": entry_type, "fields": {},
-                 "raw": text[start:end], "issues": local_issues + field_issues,
+                 "raw": text[start:end], "source_start": start, "source_end": end, "issues": local_issues + field_issues,
                  "_tokens": field_tokens}
         entries.append(entry)
         if len(entries) > MAX_ENTRIES:
