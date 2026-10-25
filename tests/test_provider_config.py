@@ -1,5 +1,6 @@
 """Provider configuration, selection and retained offline audit contracts."""
 import copy
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -251,7 +252,8 @@ class SchemaUpgradeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'cite-audit.sqlite3'
             migrations = Path(storage.__file__).parent / 'migrations'
-            with sqlite3.connect(path) as conn:
+            # sqlite3's context manager commits/rolls back but does not close.
+            with closing(sqlite3.connect(path)) as conn, conn:
                 conn.executescript((migrations / '001_init.sql').read_text())
                 conn.execute("INSERT INTO provider_calls(task_id,entry_id,created_at,cache_hit,payload) VALUES(NULL,NULL,'old',0,?)", (json.dumps({'external_call': True, 'provider_id': 'old-provider'}),))
             db = Database(directory)
