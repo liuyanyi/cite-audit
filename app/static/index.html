@@ -1,59 +1,18 @@
 <!doctype html>
 <html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <meta name="description" content="Evidence-first BibTeX citation auditing workbench">
-  <title>cite-audit · 引文核验</title>
-  <link rel="stylesheet" href="/static/styles.css">
-  <script src="/static/app.js" defer></script>
-</head>
-<body>
-  <svg class="icon-definitions" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
-    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4m-5 5 5-5 5 5M4 15v5h16v-5"/></symbol>
-    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
-    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
-    <symbol id="i-settings" viewBox="0 0 24 24"><path d="m9 4 1-2h4l1 2 3 2 2 .5 2 3-1.5 2v3L22 17l-2 3-2-.5-3 2-1 1h-4l-1-2-3-1-2 .5-2-3 1.5-2v-3L2 9l2-3 2 .5z"/><circle cx="12" cy="12" r="3"/></symbol>
-    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></symbol>
-    <symbol id="i-link" viewBox="0 0 24 24"><path d="M14 4h6v6m0-6L9 15M10 5H4v15h15v-6"/></symbol>
-    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M15 8V3H3v13h5"/></symbol>
-    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M5.3 7a8 8 0 0 1 13.6-1L20 9M4 15l1.1 3A8 8 0 0 0 18.7 17"/></symbol>
-    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
-    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
-    <symbol id="i-document" viewBox="0 0 24 24"><path d="M14 3H5v18h14V8zm0 0v5h5M8 12h8M8 16h6"/></symbol>
-    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v13m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
-    <symbol id="i-alert" viewBox="0 0 24 24"><path d="m12 3 10 18H2zM12 9v5m0 3v1"/></symbol>
-  </defs></svg>
-  <a class="skip-link" href="#workspace">跳至工作区</a>
-  <div class="app-shell">
-    <aside class="sidebar" aria-label="任务导航">
-      <a class="brand" href="/" aria-label="cite-audit 首页"><span class="brand-mark">c<span>:</span></span><span>cite-audit</span></a>
-      <button id="new-task" class="button primary new-task"><svg class="icon"><use href="#i-plus"/></svg>上传 BibTeX</button>
-      <div class="sidebar-heading"><span>检查记录</span><span id="task-count" class="subtle">0</span></div>
-      <nav id="task-list" class="task-list" aria-label="历史任务"><p class="sidebar-empty">暂无检查记录</p></nav>
-      <div class="sidebar-footer"><span class="local-indicator"><span></span>本地工作区</span><button id="settings-button" class="button quiet" aria-label="打开设置"><svg class="icon"><use href="#i-settings"/></svg>设置</button></div>
-    </aside>
-    <main id="workspace" class="workspace" tabindex="-1">
-      <header class="workspace-header"><div><p class="eyebrow">EVIDENCE FIRST</p><h1 id="task-title">引文，逐条有据。</h1><div id="task-subtitle" class="header-meta">从一份 BibTeX 开始。</div></div><div id="task-actions" class="header-actions"></div></header>
-      <div id="connection-error" class="banner error" role="alert" hidden></div>
-      <section id="welcome" class="welcome"><div class="welcome-art" aria-hidden="true"><div class="paper paper-back"></div><div class="paper"><span class="paper-key">@article{</span><span class="paper-line long"></span><span class="paper-line"></span><span class="paper-line short"></span><span class="paper-end">}</span><span class="paper-check">✓</span></div></div><h2>让每一处修正都有出处</h2><p>比较原值、核验来源，保留你对文献的判断。</p><button id="welcome-upload" class="button primary"><svg class="icon"><use href="#i-upload"/></svg>上传 .bib 文件</button><span class="welcome-note">原文件始终保留，不自动改写。</span><a class="text-link sample-link" href="/examples/demo.bib" id="sample-link">下载示例 BibTeX</a></section>
-      <section id="task-workspace" hidden>
-        <div id="mode-banner"></div>
-        <section id="task-metrics" class="metrics" aria-label="任务进度"></section>
-        <div id="progress-track" class="progress-track" role="progressbar" aria-label="核验进度" aria-valuemin="0" aria-valuemax="100"><div id="progress-fill"></div></div>
-        <div id="parse-issues"></div>
-        <div class="review-layout">
-          <section class="entries-panel" aria-label="文献列表"><div class="list-controls"><label class="search-box"><svg class="icon"><use href="#i-search"/></svg><input id="entry-search" type="search" placeholder="搜索标题或 citation key" aria-label="搜索标题或 citation key"></label><div class="filter-row"><select id="entry-filter" aria-label="筛选文献"><option value="all">全部文献</option><option value="issues">存在问题</option><option value="conflict">字段冲突</option><option value="missing_doi">DOI 缺失 / 未核验</option><option value="upgrade">正式版候选</option><option value="insufficient">证据不足</option><option value="failed">查询失败</option><option value="chinese">中文文献</option></select><span id="entry-count" class="subtle"></span></div></div><div id="entries" class="entries" role="list"></div></section>
-          <section id="entry-detail" class="detail-panel" aria-label="文献详情"><div class="empty-detail">选择一条文献查看证据</div></section>
-        </div>
-      </section>
-    </main>
-  </div>
-  <dialog id="upload-dialog" class="dialog upload-dialog" aria-labelledby="upload-title"><form id="upload-form"><div class="dialog-heading"><h2 id="upload-title">新建检查</h2><button class="icon-button" type="button" data-close="upload-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"/></svg></button></div><label id="drop-zone" class="drop-zone"><input id="bib-file" name="file" type="file" accept=".bib,text/plain,application/x-bibtex" required><svg class="icon"><use href="#i-upload"/></svg><strong id="upload-filename">选择或拖入 .bib 文件</strong><span>只检查，不改写原文件</span></label><fieldset class="mode-choice"><legend>检查方式</legend><label><input type="radio" name="mode" value="mock" checked><span><strong>离线演示</strong><small>模拟证据，不作真实核验</small></span></label><label><input type="radio" name="mode" value="live"><span><strong>在线核验</strong><small>向已配置来源发送必要文献字段</small></span></label></fieldset><label class="field-label" for="cnki-mode">CNKI 公开网页补充检索</label><select id="cnki-mode" name="cnki_mode"><option value="off">关闭</option><option value="chinese">仅中文条目</option><option value="all">全部条目</option></select><label id="parent-task-label" class="checkbox-label" hidden><input type="checkbox" id="link-parent" checked>作为当前任务的增量复查</label><div id="upload-error" class="inline-error" role="alert"></div><div class="dialog-footer"><button type="button" class="button quiet" data-close="upload-dialog">取消</button><button id="start-upload" class="button primary" type="submit">开始离线演示<svg class="icon"><use href="#i-arrow"/></svg></button></div></form></dialog>
-  <dialog id="settings-dialog" class="dialog settings-dialog" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">设置</h2><button class="icon-button" type="button" data-close="settings-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"/></svg></button></div><form id="settings-form"><div class="settings-content"><p class="settings-notice">密钥仅保存在本机后端。留空保留已有密钥。</p><section class="provider-settings"><div class="section-heading"><h3>大模型</h3><span id="llm-key-state" class="badge neutral"></span></div><label>Base URL<input name="llm.base_url" type="url" placeholder="https://api.example.com/v1" autocomplete="off"></label><div class="form-columns"><label>模型<input name="llm.model" placeholder="模型名称" autocomplete="off"></label><label>API key<input name="llm.api_key" type="password" placeholder="输入新密钥" autocomplete="new-password"></label></div><div class="provider-test"><button type="button" class="button small" data-test="llm">测试大模型连接</button><span id="test-llm" class="test-result" role="status"></span></div><button type="button" class="button quiet danger-text small remove-key" data-remove-key="llm" hidden>移除已保存密钥</button></section><section class="provider-settings"><div class="section-heading"><h3>DeepSeek Search / Fetch</h3><span id="deepseek-key-state" class="badge neutral"></span></div><label>API key<input name="deepseek.api_key" type="password" placeholder="输入新密钥" autocomplete="new-password"></label><div class="provider-test"><button type="button" class="button small" data-test="deepseek">测试搜索 / Fetch 能力</button><span id="test-deepseek" class="test-result" role="status"></span></div><button type="button" class="button quiet danger-text small remove-key" data-remove-key="deepseek" hidden>移除已保存密钥</button></section><section class="provider-settings"><div class="section-heading"><h3>Semantic Scholar</h3><span id="semantic_scholar-key-state" class="badge neutral"></span></div><div class="form-columns"><label>API key<input name="semantic_scholar.api_key" type="password" placeholder="输入新密钥" autocomplete="new-password"></label><label>获批速率（次 / 秒）<input name="semantic_scholar.rate_per_second" type="number" min="0.05" max="10" step="0.05"></label></div><div class="provider-test"><button type="button" class="button small" data-test="semantic_scholar">测试 Semantic Scholar</button><span id="test-semantic_scholar" class="test-result" role="status"></span></div><button type="button" class="button quiet danger-text small remove-key" data-remove-key="semantic_scholar" hidden>移除已保存密钥</button></section><details class="advanced-settings"><summary>公开来源、调用预算与缓存</summary><div class="public-tests"><div class="provider-test"><button type="button" class="button small" data-test="crossref">测试 Crossref</button><span id="test-crossref" class="test-result" role="status"></span></div><div class="provider-test"><button type="button" class="button small" data-test="arxiv">测试 arXiv</button><span id="test-arxiv" class="test-result" role="status"></span></div></div><h3>调用预算</h3><div class="form-columns"><label>单条上限<input name="budget.per_entry" type="number" min="1" max="100" step="1"></label><label>单任务上限<input name="budget.per_task" type="number" min="1" max="5000" step="1"></label></div><h3>缓存有效期（天）</h3><div class="form-columns three"><label>元数据<input name="cache.metadata_days" type="number" min="1" max="365"></label><label>检索结果<input name="cache.search_days" type="number" min="1" max="365"></label><label>无结果<input name="cache.negative_days" type="number" min="1" max="365"></label></div><button id="clear-cache" type="button" class="button danger-text small">清除查询缓存</button><p class="subtle cache-note">不删除任务历史、上传文件或历史证据。</p><button id="clear-manual" type="button" class="button danger-text small">删除人工导入记录</button><p class="subtle cache-note">停止在后续检查中复用；历史任务中的证据快照保留。</p></details><p class="settings-notice">连接测试使用已保存配置，会发起真实请求，可能计费。</p><div id="settings-error" class="inline-error" role="alert"></div></div><div class="dialog-footer"><button type="button" class="button quiet" data-close="settings-dialog">关闭</button><button id="save-settings" type="submit" class="button primary">保存设置</button></div></form></dialog>
-  <dialog id="manual-dialog" class="dialog" aria-labelledby="manual-title"><form id="manual-form"><div class="dialog-heading"><h2 id="manual-title">补充人工题录</h2><button class="icon-button" type="button" data-close="manual-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"/></svg></button></div><p class="notice">人工导入保留为独立证据，不代表已在线核验。</p><label>来源链接<input name="source_url" type="url" placeholder="https://…"></label><div class="form-columns"><label>格式<select name="format"><option value="bibtex">BibTeX</option><option value="ris">RIS</option><option value="text">结构化文本 / 仅链接</option></select></label><label class="manual-file-label">导入文件<input id="manual-file" type="file" accept=".bib,.ris,.txt,text/plain"></label></div><label>题录文本<textarea name="text" rows="9" placeholder="粘贴单条 BibTeX / RIS，或每行“字段: 值”的文本。也可仅填写详情链接。"></textarea></label><div id="manual-error" class="inline-error" role="alert"></div><div class="dialog-footer"><button type="button" class="button quiet" data-close="manual-dialog">取消</button><button type="submit" class="button primary">保存人工证据</button></div></form></dialog>
-  <dialog id="confirm-dialog" class="dialog confirm-dialog" aria-labelledby="confirm-title"><form id="confirm-form"><div class="dialog-heading"><h2 id="confirm-title">确认操作</h2><button class="icon-button" type="button" data-close="confirm-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"/></svg></button></div><p id="confirm-description" class="confirm-description"></p><div id="confirm-options"></div><div class="dialog-footer"><button type="button" class="button quiet" data-close="confirm-dialog">取消</button><button id="confirm-submit" type="submit" class="button primary">确认</button></div></form></dialog>
-  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <meta
+      name="description"
+      content="Evidence-first BibTeX citation auditing workbench"
+    />
+    <title>cite-audit · 引文核验</title>
+    <script type="module" crossorigin src="/static/assets/index-DzjiCh5T.js"></script>
+    <link rel="stylesheet" crossorigin href="/static/assets/index-Db3tcJxt.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
 </html>

@@ -1,8 +1,7 @@
-"""Run the dependency-free JS DOM contract smoke, without live provider calls.
+"""Render real backend mock results through React; no live provider calls.
 
-This validates rendering branches and accessibility attribute serialization, not
-browser layout. Run: python -m unittest discover -s tests -v
-Node.js is optional for application users and required only for this JS test.
+Node and frontend dev dependencies are required for this integration check.
+CI installs both; Python-only application users may skip it explicitly.
 """
 from pathlib import Path
 import json
@@ -22,7 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class FrontendContractTests(unittest.TestCase):
-    @unittest.skipUnless(shutil.which('node'), 'Node.js is needed for frontend contract tests')
+    @unittest.skipUnless(shutil.which('node') and (ROOT / 'frontend/node_modules/vitest/vitest.mjs').exists(),
+                         'Node.js and npm ci in frontend are needed for React integration tests')
     def test_mock_records_render_every_tab_and_filter(self):
         bib = '''@article{correct, title={A clear original title}, author={Smith, Jane}, year={2024}, journal={Journal of Example}}
 @article{wrongdoi,title={Original wrong DOI record},author={Smith, Jane},year={2020},doi={10.5555/wrong}}
@@ -51,13 +51,19 @@ class FrontendContractTests(unittest.TestCase):
                     'parse_issues': []}
             fixture = Path(directory) / 'task.json'
             fixture.write_text(json.dumps(task), encoding='utf-8')
-            for line_endings in ('native', 'crlf'):
-                environment = {**os.environ, 'CITE_AUDIT_TEST_CRLF': '1' if line_endings == 'crlf' else '0'}
-                result = subprocess.run([shutil.which('node'), str(ROOT / 'tests/frontend_smoke.js'), str(fixture)],
-                                        cwd=ROOT, text=True, encoding='utf-8', capture_output=True, timeout=20, env=environment)
-                self.assertEqual(result.returncode, 0, line_endings + ': ' + result.stdout + result.stderr)
-                self.assertIn('"rendering":"passed"', result.stdout)
-                self.assertIn('Unverified DOI labels and filters passed.', result.stdout)
+            report = Path(directory) / 'react-report.json'
+            environment = {**os.environ, 'CITE_AUDIT_FIXTURE': str(fixture),
+                           'CITE_AUDIT_FIXTURE_REPORT': str(report)}
+            result = subprocess.run(
+                [shutil.which('node'), str(ROOT / 'frontend/node_modules/vitest/vitest.mjs'),
+                 'run', 'src/backend-fixture.test.tsx'],
+                cwd=ROOT / 'frontend', text=True, encoding='utf-8',
+                capture_output=True, timeout=90, env=environment,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(report.exists(), result.stdout + result.stderr)
+            self.assertEqual({'entries': 8, 'tabs': 32}, json.loads(report.read_text(encoding='utf-8')))
+
 
 
 if __name__ == '__main__':

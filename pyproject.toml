@@ -20,4 +20,4 @@ dependencies = [
 packages = ["app"]
 
 [tool.setuptools.package-data]
-app = ["static/*", "migrations/*.sql"]
+app = ["static/*", "static/assets/*", "migrations/*.sql"]

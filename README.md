@@ -8,10 +8,12 @@ UI 原则：**“Avoid unnecessary secondary labels and descriptions. Let the la
 
 ## 启动
 
+当前实现仍在 Draft PR #1 的 `feat/evidence-workbench` 分支，尚未合并到 `main`。以下命令明确检出该分支。
+
 Python 3.11+，推荐 3.12。支持 macOS、Linux 和 Windows；Windows 文件锁分支有单元测试，原生 Windows 整体运行仍需实机验证。
 
 ```bash
-git clone https://github.com/liuyanyi/cite-audit.git
+git clone --branch feat/evidence-workbench https://github.com/liuyanyi/cite-audit.git
 cd cite-audit
 python -m venv .venv
 # macOS / Linux
@@ -25,7 +27,7 @@ python -m app
 
 上传 `examples/demo.bib`，选择“离线演示”，即可不使用密钥跑完整流程。示例文献、DOI 和模拟证据不能用于真实论文修订。`requirements.lock` 固定全部运行时依赖；`requirements.txt` 列出直接依赖。
 
-也可 `python -m pip install .`，之后从任意目录运行 `python -m app`。静态资源及迁移文件包含在 wheel 中。
+也可 `python -m pip install .`，之后从任意目录运行 `python -m app`。React 构建资源及迁移文件包含在 wheel 中。前端源文件修改后应先按下方开发步骤构建，再打包。
 
 ## 在线核验
 
@@ -76,11 +78,23 @@ key 不回传前端，不写入结果或日志。UI 保存的 key 位于本地�
 
 ```bash
 python -m unittest discover -s tests -v
-node --check app/static/app.js
 python scripts/benchmark_offline.py
 python -m pip wheel --no-deps -w dist .
+python scripts/check_wheel.py dist
 ```
 
-Node 20+ 用于无浏览器 DOM 合约测试，无前端构建步骤。Node 缺失时对应 unittest 明确跳过。完整的桌面/移动视觉验收需要真实浏览器；本次环境阻断了该部分，未将静态测试冒充视觉通过。
+前端使用 React + TypeScript + Vite，源码位于 `frontend/src/`；构建产物随 Python 包分发。日常启动已构建版本只需 Python，不需要 Node。修改前端时需要 Node 22.12+ 与 npm，先安装依赖、运行检查并构建：
+
+```bash
+cd frontend
+npm ci
+npm run typecheck
+npm test
+npm run build
+```
+
+`frontend/src/` 是前端唯一源码入口，不手工修改 `app/static/` 的生成文件。构建会更新这些产物，随后回到仓库根目录运行 Python 检查与打包，并一起提交源码、lockfile 与构建产物。开发时可在后端正常运行的同时执行 `npm run dev`，通过 Vite 代理访问本机 API；不需要放宽后端的 Host/Origin 或 CORS 安全限制。
+
+前端单元与组件交互测试使用 Vitest、jsdom 和 Testing Library；Python 测试另将真实 mock 服务生成的八类文献交给 React 渲染，避免只测手写 fixture。未安装 Node/前端开发依赖时该桥接测试明确跳过，CI 中必须安装后执行。jsdom 不是浏览器，不代表桌面/移动视觉和真实交互已验收。
 
 详见[架构和支持范围](docs/architecture.md)、[验收记录](docs/validation.md)以及原[实施需求](docs/implementation-plan.md)。

@@ -17,3 +17,5 @@ artifacts/
 build/
 *.egg-info/
 dist/
+
+frontend/node_modules/

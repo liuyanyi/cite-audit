@@ -10,7 +10,10 @@
 - `app/worker.py`：单实例任务执行、预算、增量复查、结果版本。
 - `app/locking.py`：POSIX flock / Windows msvcrt 单实例锁。
 - `app/main.py`：FastAPI，页面和 JSON API；`/api/docs` 提供接口说明。
-- `app/static/`：无构建依赖的原生 JS/CSS，文本节点渲染所有外部内容。
+- `frontend/src/`：React + TypeScript 组件、交互状态与类型化 API 层；Vite 负责开发和构建。外部内容始终按文本渲染，不注入 HTML。
+- `app/static/`：随仓库和 wheel 分发的前端构建产物；FastAPI 同源提供页面、哈希资源和 API。运行已构建应用不需要 Node。
+
+前端以 `frontend/src/` 为唯一源码入口；`app/static/` 是 Vite 生成文件，不手工编辑。构建产物包含在 wheel 中，以保持安装后的应用仅依赖 Python。
 
 ## 解析器
 
