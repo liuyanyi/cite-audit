@@ -1,4 +1,4 @@
-"""Smoke-test an installed wheel away from the checkout, without external calls."""
+"""Smoke-test a wheel offline: uv run --locked python scripts/check_wheel.py dist."""
 from pathlib import Path
 import os
 import subprocess
@@ -14,7 +14,10 @@ def main():
     wheel = max(wheels, key=lambda path: path.stat().st_mtime)
     with tempfile.TemporaryDirectory() as temporary:
         target = Path(temporary) / 'installed'
-        subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-deps', '--target', str(target), str(wheel)], check=True)
+        subprocess.run([
+            'uv', 'pip', 'install', '--python', sys.executable, '--offline',
+            '--no-deps', '--target', str(target), str(wheel),
+        ], check=True)
         environment = {**os.environ, 'PYTHONPATH': str(target), 'CITE_AUDIT_WHEEL_ROOT': str(target)}
         subprocess.run([sys.executable, '-c', '''
 import os

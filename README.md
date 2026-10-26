@@ -10,24 +10,22 @@ UI 原则：**“Avoid unnecessary secondary labels and descriptions. Let the la
 
 当前实现仍在 Draft PR #1 的 `feat/evidence-workbench` 分支，尚未合并到 `main`。以下命令明确检出该分支。
 
-Python 3.11+，推荐 3.12。支持 macOS、Linux 和 Windows；Windows 文件锁分支有单元测试，原生 Windows 整体运行仍需实机验证。
+使用 [uv](https://docs.astral.sh/uv/getting-started/installation/) 0.13.4+ 管理 Python 和依赖。支持 Python 3.11+，项目默认使用 3.12（见 `.python-version`）。支持 macOS、Linux 和 Windows；Windows 文件锁分支有单元测试，原生 Windows 整体运行仍需实机验证。
 
 ```bash
 git clone --branch feat/evidence-workbench https://github.com/liuyanyi/cite-audit.git
 cd cite-audit
-python -m venv .venv
-# macOS / Linux
-source .venv/bin/activate
-# Windows PowerShell 改用：.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.lock
-python -m app
+uv sync --locked
+uv run --locked python -m app
 ```
 
 打开 http://127.0.0.1:8000 。程序只绑定本机地址，不提供公开部署或多用户安全边界。不要使用多个 Uvicorn workers。
 
-上传 `examples/demo.bib`，选择“离线演示”，即可不使用密钥跑完整流程。示例文献、DOI 和模拟证据不能用于真实论文修订。`requirements.lock` 固定全部运行时依赖；`requirements.txt` 列出直接依赖。
+以上命令在 macOS、Linux 和 Windows PowerShell 中相同，不需要手动创建或激活虚拟环境；uv 会管理项目的 `.venv`，并在需要时下载 Python。首次同步需要联网下载依赖。
 
-也可 `python -m pip install .`，之后从任意目录运行 `python -m app`。React 构建资源及迁移文件包含在 wheel 中。前端源文件修改后应先按下方开发步骤构建，再打包。
+上传 `examples/demo.bib`，选择“离线演示”，即可不使用密钥跑完整流程。示例文献、DOI 和模拟证据不能用于真实论文修订。`pyproject.toml` 声明直接依赖，`uv.lock` 固定跨平台解析结果和包哈希；不再维护重复的 requirements 文件。`--locked` 会在配置与锁文件不一致时失败，而不是静默改锁。
+
+React 构建资源及迁移文件包含在 wheel 中。前端源文件修改后应先按下方开发步骤构建，再打包。
 
 ## 在线核验
 
@@ -82,11 +80,16 @@ key 不回传前端，不写入结果或日志。UI 保存的 key 位于本地�
 ## 检查与开发
 
 ```bash
-python -m unittest discover -s tests -v
-python scripts/benchmark_offline.py
-python -m pip wheel --no-deps -w dist .
-python scripts/check_wheel.py dist
+uv sync --locked
+uv run --locked python -m unittest discover -s tests -v
+uv run --locked python scripts/benchmark_offline.py
+uv build --wheel
+uv run --locked python scripts/check_wheel.py dist
 ```
+
+`uv build` 使用 `pyproject.toml` 中固定版本的构建后端；wheel smoke 使用 uv 安装本地 wheel 到临时目录，不依赖环境中存在 pip，也不访问在线核验服务。CI 固定 uv 版本，在 Ubuntu/Windows 上执行同样的锁定同步和检查。
+
+修改依赖时使用 `uv add` / `uv remove`，或修改 `pyproject.toml` 后运行 `uv lock`；同时提交 `pyproject.toml` 和 `uv.lock`。有意更新某个间接依赖可运行 `uv lock --upgrade-package 包名`，不要手改 `uv.lock`。更新后重新执行上述检查；日常安装和 CI 保持 `--locked`。
 
 前端使用 React + TypeScript + Vite，源码位于 `frontend/src/`；构建产物随 Python 包分发。日常启动已构建版本只需 Python，不需要 Node。修改前端时需要 Node 22.12+ 与 npm，先安装依赖、运行检查并构建：
 

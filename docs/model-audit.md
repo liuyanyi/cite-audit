@@ -30,6 +30,6 @@ HTTP 客户端使用既有 DNS 固定连接、TLS 校验、公开 IP 校验、�
 
 ## 离线验证与升级
 
-`python -m unittest discover -s tests -v` 使用真实已安装 MMSP + 固定 SDK 和 MockTransport 的协议数据，不使用真实 key、网络、额度。覆盖三协议、结构化输出、显式凭据、重试/预算、重定向、gzip、缺失 usage、截断响应、转义凭据、单价匹配及失败缓存写入。
+`uv run --locked python -m unittest discover -s tests -v` 使用真实已安装 MMSP + 固定 SDK 和 MockTransport 的协议数据，不使用真实 key、网络、额度。覆盖三协议、结构化输出、显式凭据、重试/预算、重定向、gzip、缺失 usage、截断响应、转义凭据、单价匹配及失败缓存写入。
 
 当前请求始终包含配置的 temperature；不支持该参数的模型尚不能使用（目录中列出并不代表已兼容）。这些检查不能证明任意供应商兼容；真实调用仅由用户主动选择在线任务或连接测试。升级 MMSP / OpenAI / Anthropic / httpx2 后必须重跑上述测试并检查窄子类接口；不可直接移除安全桥来绕过兼容性问题。

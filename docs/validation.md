@@ -1,5 +1,18 @@
 # 离线验收记录
 
+## uv 原生开发流程（2026-10-26）
+
+Python 开发统一使用 `pyproject.toml` + uv 实际生成的通用 `uv.lock`，删除重复的 `requirements.txt` / `requirements.lock`。迁移保留原锁文件全部 52 个依赖的版本，仅补充 Windows / WebAssembly 条件依赖；包来源和哈希指向公开 PyPI，不含本机镜像地址。应用功能及前端资源未改动。
+
+- uv 0.13.4、Linux / Python 3.12.14，从新建 `.venv` 执行 `uv sync --locked`：通过。
+- `uv run --locked python -m unittest discover -s tests -v`：228 项通过，无跳过；包含真实 mock 数据到 React 的渲染桥接。
+- `uv run --locked python scripts/benchmark_offline.py`：8/8 完成，0 执行崩溃、0 外部调用，重复运行 7/8 复用；不是实际文献准确率测量。
+- `uv build --wheel` 和 `uv run --locked python scripts/check_wheel.py dist`：通过。uv 将本地 wheel 离线安装到独立临时目录，在非仓库路径验证 React 资源、离线任务、原文件/导出保留和持久文献库/调用审计；不要求安装 pip。
+- `uv lock --check --offline`、`uv pip check`、Python 编译及 `git diff --check`：通过；另验证配置变更时锁定检查失败且不改写锁文件。TypeScript 检查和 40 项 React/Vitest 测试通过。
+- CI 切换官方 `astral-sh/setup-uv`（v10.3.2，固定完整提交 SHA），uv 固定为 0.13.4；Ubuntu/Windows 执行锁定同步和相同检查。本节是本地验收，远端检查结果须以该次提交为准。
+
+以下章节保留迁移前的历史命令和验收结果，不是当前安装说明；当前命令以 README 和本节为准。
+
 ## 文献库、整库导出与 MMSP（2026-10-25）
 
 本轮本地独立复验：228 项 Python 测试、40 项 React/Vitest 测试全部通过，TypeScript、Prettier、生产构建、Python 编译、依赖一致性检查与 diff 检查通过。覆盖真实安装 MMSP 三协议的模拟 SSE、应用重试与费用未知状态、配置迁移/选模、过期再确认/失败保留、永久来源复用、ACL 身份与类型、整库安全导出。

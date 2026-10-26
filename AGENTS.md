@@ -4,7 +4,7 @@ Local, single-user evidence-first BibTeX auditing workbench. Follow docs/impleme
 
 UI principle: “Avoid unnecessary secondary labels and descriptions. Let the layout do the explaining”.
 
-Run `python -m unittest discover -s tests -v` before shipping. Use `python -m app` for the local application.
+Use uv for all Python development. Run `uv sync --locked`, then `uv run --locked python -m unittest discover -s tests -v` before shipping. Use `uv run --locked python -m app` for the local application. Keep `pyproject.toml` and the generated universal `uv.lock` in sync; do not introduce parallel requirements lockfiles. Build with `uv build --wheel` and verify with `uv run --locked python scripts/check_wheel.py dist`.
 
 Frontend source of truth is React + TypeScript in `frontend/src/`, built with Vite. Do not hand-edit generated `app/static/` assets; run `npm ci`, `npm run typecheck`, `npm test`, and `npm run build` in `frontend/` after source changes. Keep the lockfile and generated assets in sync. The installed Python application serves these assets locally and does not require Node at runtime.
 
