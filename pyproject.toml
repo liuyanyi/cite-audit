@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools==84.1.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cite-audit"
+version = "0.1.0"
+description = "Local, evidence-first BibTeX citation auditing workbench"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "pydantic==2.13.4",
+  "python-multipart==0.0.32",
+  "uvicorn==0.52.1",
+  "mmsp==0.5.6",
+  "openai==3.37.0",
+  "anthropic==2.3.0",
+  "httpx2==2.16.0",
+]
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.setuptools.package-data]
+app = ["static/*", "static/assets/*", "migrations/*.sql"]
+
+[tool.uv]
+required-version = ">=0.13.4"
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
