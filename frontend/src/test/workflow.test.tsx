@@ -21,8 +21,20 @@ const mount = (path = '/tasks') => render(<MemoryRouter initialEntries={[path]}>
 describe('navigation and truth states', () => {
   it('starts on file tasks rather than mixed citation results', async () => { mount(); expect(await screen.findByText('论文引用')).toBeVisible(); expect(screen.getByRole('heading', { name: 'Bib 核查任务' })).toBeVisible(); expect(screen.queryByText('Synthetic Paper')).not.toBeInTheDocument(); });
   it('separates valid preprint verification from a recommended version change', async () => { mount('/tasks/t1/entries/e1'); expect(await screen.findByText('当前版本一致')).toBeVisible(); expect(screen.queryByText('明确冲突')).not.toBeInTheDocument(); await userEvent.click(screen.getByRole('tab', { name: '推荐版本差异' })); expect(screen.getByText('版本切换需更新')).toBeVisible(); expect(screen.getByText('2025')).toBeVisible(); expect(screen.queryByText('明确冲突')).not.toBeInTheDocument(); });
+  it('does not repeat the generic unconfirmed-publication reason in each row', async () => {
+    const original = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string, options?: RequestInit) => url === '/api/tasks/t1/entries/e1' ? reply({ ...entry, version_status: 'unknown', identity_reason: 'Source unavailable', field_assessments: [{ field: 'year', original_value: '2024', reference_value: null, judgment: 'unverifiable', reason: 'Current publication is not confirmed', evidence: [] }] }) : original(url, options));
+    mount('/tasks/t1/entries/e1'); expect(await screen.findByText('Source unavailable')).toBeVisible(); expect(screen.getByText('未核实')).toBeVisible(); expect(screen.queryByText('Current publication is not confirmed')).not.toBeInTheDocument();
+  });
   it('locates source evidence and returns to a field', async () => { mount('/tasks/t1/entries/e1'); await screen.findByText('当前版本一致'); await userEvent.click(screen.getByRole('button', { name: '离线演示来源 1' })); expect(document.getElementById('source-s1')).toHaveClass('highlighted'); await userEvent.click(screen.getByRole('button', { name: 'year 2024' })); expect(document.getElementById('field-year')).toHaveClass('highlighted'); });
   it('preserves list filters in back navigation', async () => { mount('/tasks/t1/entries/e1?q=Synthetic&identity=confirmed'); await screen.findByText('当前版本一致'); expect(screen.getByRole('link', { name: '返回任务' })).toHaveAttribute('href', '/tasks/t1?q=Synthetic&identity=confirmed'); });
+  it('distinguishes a processed partial task from a successful audit', async () => {
+    const original = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string, options?: RequestInit) => url === '/api/tasks/t1' ? reply({ ...task, mode: 'online', execution_status: 'partial', summary: { ...summary, confirmed: 0, unresolved: 1 } }) : original(url, options));
+    mount('/tasks/t1'); expect(await screen.findByText('已处理')).toBeVisible(); expect(screen.getByText('未处理 / 执行失败')).toBeVisible();
+    expect(screen.queryByText('检查完成')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('已处理 100%').firstElementChild).toHaveClass('warning');
+  });
   it('opens knowledge as an independent page', async () => { mount('/knowledge'); expect(await screen.findByText('暂无文章')).toBeVisible(); expect(screen.getByRole('heading', { name: '文献知识库' })).toBeVisible(); });
   it('switches theme without losing the page', async () => { mount(); await screen.findByText('论文引用'); await userEvent.click(screen.getByRole('button', { name: '切换深色模式' })); expect(document.documentElement.dataset.theme).toBe('dark'); expect(localStorage.getItem('cite-audit-theme')).toBe('dark'); });
 });

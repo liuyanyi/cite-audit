@@ -74,11 +74,11 @@ export default function SettingsPage() {
     <div className="settings-layout">
       <nav className="settings-nav" aria-label="设置分组">{sections.map(item => <button key={item.id} className={section === item.id ? 'active' : ''} aria-current={section === item.id ? 'page' : undefined} onClick={() => setSection(item.id)}><item.icon size={16} />{item.label}</button>)}</nav>
       <div className="stack">
-        {dirty && <div className="notice warning compact">有未保存的更改。连接测试使用已保存配置。</div>}
+        {dirty && <div className="notice warning compact">请先保存更改，再测试连接。</div>}
         {section === 'sources' && <section className="panel"><div className="panel-body">
-          <h2 className="settings-section-title">数据源</h2><p className="settings-section-description">已配置不等于已连通。连接测试将向对应来源发起真实请求。</p>
+          <h2 className="settings-section-title">数据源</h2>
           {draft.sources.map(source => <div key={source.id}>
-            <div className="provider-row"><div className="provider-icon">{source.name.slice(0, 2)}</div><div className="provider-info"><h3>{providerNames[source.id] || source.name}</h3><p>{source.implemented ? source.capabilities.join(' · ') : '尚未实现连接'} · {source.requires_key ? '需要 API key' : '密钥可选 / 无需密钥'}</p></div>
+            <div className="provider-row"><div className="provider-icon">{source.name.slice(0, 2)}</div><div className="provider-info"><h3>{providerNames[source.id] || source.name}</h3>{(!source.implemented || source.requires_key) && <p>{!source.implemented ? '尚未接入' : '需要 API key'}</p>}</div>
               <Badge tone={source.status === 'available' ? 'success' : source.status === 'unavailable' ? 'danger' : 'neutral'}>{statusLabels[source.status] || source.status}</Badge>
               <Button className="compact" disabled={busy || dirty || !source.implemented} onClick={() => setConfirmation({ kind: 'source', id: source.id, name: source.name })}>测试连接</Button>
               <input className="toggle" type="checkbox" aria-label={`启用 ${source.name}`} disabled={!source.implemented || busy} checked={source.enabled} onChange={e => change(current => ({ ...current, sources: current.sources.map(item => item.id === source.id ? { ...item, enabled: e.target.checked } : item) }))} />
@@ -87,26 +87,26 @@ export default function SettingsPage() {
           </div>)}
         </div></section>}
         {section === 'model' && <section className="panel"><div className="panel-body">
-          <div className="provider-row"><div className="provider-info"><h2 className="settings-section-title">模型连接测试</h2><p>通过 MMSP 发起显式连接测试；当前核查流程不自动调用模型。</p></div><input className="toggle" type="checkbox" aria-label="启用模型测试" checked={draft.model.enabled} onChange={e => change(current => ({ ...current, model: { ...current.model, enabled: e.target.checked } }))} /></div>
+          <div className="provider-row"><div className="provider-info"><h2 className="settings-section-title">模型连接测试</h2><p>仅连接测试，核查流程尚未接入。</p></div><input className="toggle" type="checkbox" aria-label="启用模型测试" checked={draft.model.enabled} onChange={e => change(current => ({ ...current, model: { ...current.model, enabled: e.target.checked } }))} /></div>
           <div className="form-grid" style={{ marginTop: 20 }}>
             <label className="form-field">协议<select value={draft.model.protocol} onChange={e => change(current => ({ ...current, model: { ...current.model, protocol: e.target.value } }))}><option value="openai-chat">OpenAI Chat Completions</option><option value="openai-responses">OpenAI Responses</option><option value="ant-messages">Anthropic Messages</option></select></label>
-            <label className="form-field">模型 ID<input value={draft.model.model} placeholder="提供方的模型标识" onChange={e => change(current => ({ ...current, model: { ...current.model, model: e.target.value } }))} /></label>
+            <label className="form-field">模型 ID<input value={draft.model.model} onChange={e => change(current => ({ ...current, model: { ...current.model, model: e.target.value } }))} /></label>
             <label className="form-field">Base URL<input type="url" value={draft.model.base_url} placeholder="https://…" onChange={e => change(current => ({ ...current, model: { ...current.model, base_url: e.target.value } }))} /></label>
             <label className="form-field">API key · {draft.model.has_api_key ? '已保存' : '未设置'}<input type="password" autoComplete="new-password" value={draft.model.api_key ?? ''} placeholder="留空不更换" onChange={e => change(current => ({ ...current, model: { ...current.model, api_key: e.target.value || undefined } }))} /></label>
             {(['timeout_seconds', 'max_retries', 'max_output_tokens'] as const).map((key, index) => <label key={key} className="form-field">{['超时（秒）', '应用重试次数', '最大输出 tokens'][index]}<input type="number" min={key === 'max_retries' ? 0 : 1} value={draft.model[key]} onChange={e => change(current => ({ ...current, model: { ...current.model, [key]: Number(e.target.value) } }))} /></label>)}
           </div>
           <div className="actions" style={{ marginTop: 16 }}>{draft.model.has_api_key && <Button onClick={() => change(current => ({ ...current, model: { ...current.model, api_key: '' } }))}>清除已存密钥（保存后生效）</Button>}{draft.model.api_key === '' && <span className="small muted">已标记清除</span>}</div>
-          <div className="notice compact" style={{ marginTop: 20 }}><div>费用来源：MMSP 公开价格目录。无法匹配价格或用量时显示“未知”。{draft.model.price != null && <details><summary>当前价格快照</summary><pre>{JSON.stringify(draft.model.price, null, 2)}</pre></details>}</div></div>
+          <div style={{ marginTop: 20 }}><div>价格来源：MMSP 公开目录 · 未匹配时费用未知。{draft.model.price != null && <details><summary>当前价格快照</summary><pre>{JSON.stringify(draft.model.price, null, 2)}</pre></details>}</div></div>
           <div className="settings-actions"><Button disabled={busy || dirty || !draft.model.enabled || !draft.model.model} onClick={() => setConfirmation({ kind: 'model' })}>测试模型连接（可能计费）</Button></div>
         </div></section>}
-        {section === 'runtime' && <section className="panel"><div className="panel-body"><h2 className="settings-section-title">预算与运行</h2><p className="settings-section-description">配置用于后续新任务。实际尝试与失败均保留审计记录。</p><div className="form-grid">
+        {section === 'runtime' && <section className="panel"><div className="panel-body"><h2 className="settings-section-title">新任务默认配置</h2><div className="form-grid" style={{ marginTop: 20 }}>
           {numeric('runtime', 'request_budget', '请求次数上限', 1, 5000)}
           {numeric('runtime', 'timeout_seconds', '来源超时（秒）', 1, 60)}
           {numeric('runtime', 'max_retries', '来源重试次数', 0, 2)}
           {numeric('runtime', 'concurrency', '并发数（当前固定）', 1, 1, true)}
           {numeric('runtime', 'max_upload_bytes', '上传上限（字节）', 1024, 20000000)}
         </div></div></section>}
-        {section === 'cache' && <section className="panel"><div className="panel-body"><h2 className="settings-section-title">缓存与知识复用</h2><p className="settings-section-description">查询缓存与共享知识分开保存。过期资料须按当前状态复核。</p><div className="form-grid">
+        {section === 'cache' && <section className="panel"><div className="panel-body"><h2 className="settings-section-title">缓存有效期</h2><div className="form-grid" style={{ marginTop: 20 }}>
           {numeric('cache', 'positive_ttl_seconds', '成功结果有效期（秒）', 0, 604800)}
           {numeric('cache', 'negative_ttl_seconds', '未命中结果有效期（秒，当前固定）', 300, 300, true)}
           {numeric('cache', 'discovery_ttl_seconds', '版本发现有效期（秒）', 0, 2592000)}
@@ -114,7 +114,7 @@ export default function SettingsPage() {
         {section === 'audit' && <><section className="panel"><div className="panel-body"><h2 className="settings-section-title">调用审计</h2><div className="stack" style={{ marginTop: 18 }}>
           <label className="flex"><input type="checkbox" disabled checked={draft.audit.enabled} onChange={e => change(current => ({ ...current, audit: { ...current.audit, enabled: e.target.checked } }))} />保存调用审计（始终开启）</label>
           <label className="flex"><input type="checkbox" disabled checked={draft.audit.retain_prompt_text} onChange={e => change(current => ({ ...current, audit: { ...current.audit, retain_prompt_text: e.target.checked } }))} />保存提示文本（当前不保留）</label>
-          <div className="small muted">密钥始终脱敏。未知成本不会计作零，不同币种不会直接相加。</div>
+          <div>密钥脱敏 · 费用按币种记录，未知费用不计作零。</div>
         </div></div></section><div className="toolbar"><select aria-label="调用来源筛选" value={provider} onChange={e => { setProvider(e.target.value); setCallPage(1); }}><option value="">全部来源</option>{draft.sources.map(source => <option key={source.id} value={source.id}>{source.name}</option>)}</select><select aria-label="调用状态筛选" value={callStatus} onChange={e => { setCallStatus(e.target.value); setCallPage(1); }}><option value="">全部状态</option><option value="success">成功</option><option value="failed">失败</option><option value="rate_limited">限流</option><option value="no_result">未命中</option></select><Button onClick={calls.refresh}>刷新记录</Button></div>{calls.error && <InlineError error={calls.error} retry={calls.refresh} />}<section className="panel">{calls.loading && !calls.data ? <Loading /> : <CallTable calls={calls.data?.items ?? []} />}</section>{calls.data && <Pagination page={callPage} total={calls.data.total} size={20} onPage={setCallPage} />}</>}
       </div>
     </div>
