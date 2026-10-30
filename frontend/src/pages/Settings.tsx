@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Database, KeyRound, ListChecks, Save, Settings2, Trash2 } from 'lucide-react';
+import { Save, Trash2 } from 'lucide-react';
+import { Navigate, useParams } from 'react-router-dom';
+import { settingsSections } from '../settingsNavigation';
 import { errorMessage, json, request, useResource } from '../api';
 import type { CallRecord, Page, Settings } from '../types';
 import { providerNames } from '../format';
@@ -7,20 +9,14 @@ import { Badge, Button, InlineError, Loading, Modal, PageHeader, Pagination, use
 import CallTable from '../components/CallTable';
 
 const statusLabels: Record<string, string> = { not_tested: '未测试', available: '可访问', unavailable: '不可访问', needs_key: '需要密钥', not_implemented: '尚未接入' };
-const sections = [
-  { id: 'sources', label: '数据源', icon: Database },
-  { id: 'model', label: '模型与密钥', icon: KeyRound },
-  { id: 'runtime', label: '预算与运行', icon: Settings2 },
-  { id: 'cache', label: '缓存与复用', icon: Database },
-  { id: 'audit', label: '调用审计', icon: ListChecks },
-];
 type Confirmation = { kind: 'model' } | { kind: 'source'; id: string; name: string } | { kind: 'cache' };
 
 export default function SettingsPage() {
   const resource = useResource<Settings>('/settings');
   const [draft, setDraft] = useState<Settings | null>(null);
   const [dirty, setDirty] = useState(false);
-  const [section, setSection] = useState('sources');
+  const { section = 'sources' } = useParams();
+  const currentSection = settingsSections.find(item => item.id === section);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
@@ -63,20 +59,19 @@ export default function SettingsPage() {
       setConfirmation(null);
     } catch (e) { setError(errorMessage(e)); } finally { setBusy(false); }
   };
+  if (!currentSection) return <Navigate to="/settings/sources" replace />;
   if (!draft) return resource.error ? <InlineError error={resource.error} retry={resource.refresh} /> : <Loading />;
   const numeric = (group: 'runtime' | 'cache', key: string, label: string, min: number, max: number, fixed = false) => {
     const values = draft[group] as unknown as Record<string, number>;
     return <label className="form-field" key={key}>{label}<input type="number" disabled={fixed} min={min} max={max} value={values[key]} onChange={e => change(current => ({ ...current, [group]: { ...current[group], [key]: Number(e.target.value) } }))} /></label>;
   };
   return <>
-    <PageHeader title="设置" actions={<Button variant="primary" disabled={busy || !dirty} onClick={() => void save()}><Save size={14} />{busy ? '处理中…' : '保存设置'}</Button>} />
+    <PageHeader title={currentSection.label} actions={<Button variant="primary" disabled={busy || !dirty} onClick={() => void save()}><Save size={14} />{busy ? '处理中…' : '保存设置'}</Button>} />
     {(error || resource.error) && <InlineError error={error || resource.error || ''} />}
-    <div className="settings-layout">
-      <nav className="settings-nav" aria-label="设置分组">{sections.map(item => <button key={item.id} className={section === item.id ? 'active' : ''} aria-current={section === item.id ? 'page' : undefined} onClick={() => setSection(item.id)}><item.icon size={16} />{item.label}</button>)}</nav>
+    <div className="settings-content">
       <div className="stack">
         {dirty && <div className="notice warning compact">请先保存更改，再测试连接。</div>}
         {section === 'sources' && <section className="panel"><div className="panel-body">
-          <h2 className="settings-section-title">数据源</h2>
           {draft.sources.map(source => <div key={source.id}>
             <div className="provider-row"><div className="provider-icon">{source.name.slice(0, 2)}</div><div className="provider-info"><h3>{providerNames[source.id] || source.name}</h3>{(!source.implemented || source.requires_key) && <p>{!source.implemented ? '尚未接入' : '需要 API key'}</p>}</div>
               <Badge tone={source.status === 'available' ? 'success' : source.status === 'unavailable' ? 'danger' : 'neutral'}>{statusLabels[source.status] || source.status}</Badge>
