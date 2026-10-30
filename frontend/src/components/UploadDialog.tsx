@@ -4,7 +4,7 @@ import { FileText, Upload, X } from 'lucide-react';
 import { errorMessage, request, useResource } from '../api';
 import { bytes } from '../format';
 import type { Settings, Task } from '../types';
-import { Button, InlineError, Modal } from './ui';
+import { Button, Checkbox, InlineError, Modal } from './ui';
 
 export function UploadDialog({ onClose }: { onClose: () => void }) {
   const navigate = useNavigate();
@@ -100,7 +100,7 @@ export function UploadDialog({ onClose }: { onClose: () => void }) {
           <label className={`radio-card ${mode === 'demo' ? 'selected' : ''}`}><input type="radio" name="mode" value="demo" checked={mode === 'demo'} onChange={() => setMode('demo')} /><span><strong>离线演示</strong><small>合成样例，非真实核验</small></span></label>
           <label className={`radio-card ${mode === 'online' ? 'selected' : ''}`}><input type="radio" name="mode" value="online" checked={mode === 'online'} onChange={() => setMode('online')} /><span><strong>在线核查</strong><small>查询已启用的文献来源</small></span></label>
         </div></div>
-        {mode === 'online' && <label className="confirmation-checkbox"><input type="checkbox" checked={onlineConsent} onChange={e => setOnlineConsent(e.target.checked)} /><span>允许向已启用的来源发送查询所需字段。</span></label>}
+        {mode === 'online' && <label className="confirmation-checkbox"><Checkbox checked={onlineConsent} onCheckedChange={value => setOnlineConsent(value === true)} /><span>允许向已启用的来源发送查询所需字段。</span></label>}
         <details className="upload-options"><summary>请求配置</summary><div className="form-grid">{runtimeFields.map(item => <label className="form-field" key={item.key}><span>{item.label}</span><input type="number" min={item.key === 'max_retries' ? 0 : 1} max={item.max} value={overrides[item.key] ?? settings?.runtime?.[item.key] ?? item.fallback} onChange={e => setOverrides(current => ({ ...current, [item.key]: Number(e.target.value) }))} /></label>)}</div></details>
       </div>
       <div className="modal-actions"><Button onClick={onClose} type="button" disabled={busy}>取消</Button><Button type="submit" variant="primary" disabled={busy || checking || !validFile || !file || (mode === 'online' && !onlineConsent)}><Upload size={14} />{busy ? '上传中…' : mode === 'demo' ? '创建演示任务' : '开始在线核查'}</Button></div>

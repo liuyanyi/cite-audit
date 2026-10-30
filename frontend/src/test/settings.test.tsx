@@ -24,7 +24,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock);
 });
 afterEach(() => vi.unstubAllGlobals());
-const mount = async () => { render(<MemoryRouter initialEntries={['/settings/sources']}><App /></MemoryRouter>); await screen.findByRole('checkbox', { name: '启用 Semantic Scholar' }); return userEvent.setup(); };
+const mount = async () => { render(<MemoryRouter initialEntries={['/settings/sources']}><App /></MemoryRouter>); await screen.findByRole('switch', { name: '启用 Semantic Scholar' }); return userEvent.setup(); };
 const writes = () => fetchMock.mock.calls.filter(call => call[1]?.method === 'PUT');
 const posts = () => fetchMock.mock.calls.filter(call => call[1]?.method === 'POST');
 const deletes = () => fetchMock.mock.calls.filter(call => call[1]?.method === 'DELETE');
@@ -32,7 +32,7 @@ const deletes = () => fetchMock.mock.calls.filter(call => call[1]?.method === 'D
 describe('settings configuration and confirmations', () => {
   it('omits unchanged keys and read-only presence fields when saving', async () => {
     const user = await mount();
-    await user.click(screen.getByRole('checkbox', { name: '启用 Semantic Scholar' }));
+    await user.click(screen.getByRole('switch', { name: '启用 Semantic Scholar' }));
     expect(writes()).toHaveLength(0);
     await user.click(screen.getByRole('button', { name: '保存设置' }));
     await waitFor(() => expect(writes()).toHaveLength(1));
@@ -44,14 +44,18 @@ describe('settings configuration and confirmations', () => {
   });
   it('sends a typed source key only after save, without returning it into the field', async () => {
     const user = await mount();
-    await user.click(screen.getByText('API key · 已保存'));
+    await user.click(screen.getByRole('button', { name: '配置 Semantic Scholar' }));
     await user.type(screen.getByLabelText('更换 Semantic Scholar 密钥'), 'test-secret-value');
     expect(writes()).toHaveLength(0);
     expect(screen.getByLabelText('更换 Semantic Scholar 密钥')).toHaveAttribute('type', 'password');
+    await user.click(screen.getByRole('button', { name: '应用更改' }));
+    expect(writes()).toHaveLength(0);
     await user.click(screen.getByRole('button', { name: '保存设置' }));
     await waitFor(() => expect(writes()).toHaveLength(1));
     expect(JSON.parse(writes()[0][1].body as string).sources[0].api_key).toBe('test-secret-value');
-    await waitFor(() => expect(screen.getByLabelText('更换 Semantic Scholar 密钥')).toHaveValue(''));
+    await waitFor(() => expect(screen.getByRole('button', { name: '保存设置' })).toBeDisabled());
+    await user.click(screen.getByRole('button', { name: '配置 Semantic Scholar' }));
+    expect(screen.getByLabelText('更换 Semantic Scholar 密钥')).toHaveValue('');
   });
   it('requires explicit billing confirmation for a model test and sends confirmed true', async () => {
     const user = await mount();
@@ -100,13 +104,57 @@ describe('settings configuration and confirmations', () => {
   it('does not offer unused keys for Crossref', async () => {
     fetchMock.mockImplementation(async () => reply({ ...fixture, sources: [{ ...fixture.sources[0], id: 'crossref', name: 'Crossref', supports_api_key: false }] }));
     render(<MemoryRouter initialEntries={['/settings/sources']}><App /></MemoryRouter>);
-    await screen.findByRole('checkbox', { name: '启用 Crossref' });
-    expect(screen.queryByText('API key · 已保存')).not.toBeInTheDocument();
+    await screen.findByRole('switch', { name: '启用 Crossref' });
+    await userEvent.click(screen.getByRole('button', { name: '配置 Crossref' }));
+    expect(screen.getByText('无需 API key')).toBeVisible();
     expect(screen.queryByLabelText('更换 Crossref 密钥')).not.toBeInTheDocument();
+  });
+  it('discards source dialog changes on cancel without mutating the saved draft', async () => {
+    const user = await mount();
+    await user.click(screen.getByRole('button', { name: '配置 Semantic Scholar' }));
+    await user.type(screen.getByLabelText('更换 Semantic Scholar 密钥'), 'discarded-secret');
+    await user.click(within(screen.getByRole('dialog')).getByRole('switch', { name: '启用 Semantic Scholar' }));
+    await user.click(screen.getByRole('button', { name: '取消' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: '启用 Semantic Scholar' })).toBeChecked();
+    expect(screen.getByRole('button', { name: '保存设置' })).toBeDisabled();
+    expect(writes()).toHaveLength(0);
+    await user.click(screen.getByRole('button', { name: '配置 Semantic Scholar' }));
+    expect(screen.getByLabelText('更换 Semantic Scholar 密钥')).toHaveValue('');
+  });
+  it('filters integration cards by source name without changing configuration', async () => {
+    const user = await mount();
+    await user.type(screen.getByRole('textbox', { name: '搜索数据源' }), 'Crossref');
+    expect(screen.queryByRole('article', { name: 'Semantic Scholar' })).not.toBeInTheDocument();
+    expect(screen.getByText('没有匹配的数据源')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: '清除搜索' }));
+    expect(screen.getByRole('article', { name: 'Semantic Scholar' })).toBeVisible();
+    expect(writes()).toHaveLength(0);
+  });
+  it('filters cards with the enabled-state Radix select', async () => {
+    const user = await mount();
+    await user.click(screen.getByRole('combobox', { name: '数据源启用筛选' }));
+    await user.click(screen.getByRole('option', { name: /^未启用$/ }));
+    expect(screen.getByText('没有匹配的数据源')).toBeVisible();
+    await user.click(screen.getByRole('combobox', { name: '数据源启用筛选' }));
+    await user.click(screen.getByRole('option', { name: /^已启用$/ }));
+    expect(screen.getByRole('article', { name: 'Semantic Scholar' })).toBeVisible();
+    expect(screen.getByRole('button', { name: '保存设置' })).toBeDisabled();
+  });
+  it('shows unavailable integrations without enabling fake actions', async () => {
+    fetchMock.mockImplementation(async () => reply({ ...fixture, sources: [{ ...fixture.sources[0], enabled: false, implemented: false, has_api_key: false, status: 'not_implemented' }] }));
+    await mount();
+    const card = within(screen.getByRole('article', { name: 'Semantic Scholar' }));
+    expect(card.getByText('尚未接入')).toBeVisible();
+    expect(card.getByRole('switch', { name: '启用 Semantic Scholar' })).toBeDisabled();
+    expect(card.getByRole('switch', { name: '启用 Semantic Scholar' })).not.toBeChecked();
+    expect(card.getByRole('button', { name: '测试连接' })).toBeDisabled();
+    expect(card.getByRole('button', { name: '配置 Semantic Scholar' })).toBeDisabled();
+    expect(posts()).toHaveLength(0);
   });
   it('blocks connection tests while unsaved configuration is pending', async () => {
     const user = await mount();
-    await user.click(screen.getByRole('checkbox', { name: '启用 Semantic Scholar' }));
+    await user.click(screen.getByRole('switch', { name: '启用 Semantic Scholar' }));
     expect(screen.getByRole('button', { name: '测试连接' })).toBeDisabled();
     await user.click(screen.getByRole('link', { name: '模型与密钥' }));
     expect(screen.getByRole('button', { name: '测试模型连接（可能计费）' })).toBeDisabled();
@@ -131,7 +179,7 @@ describe('settings primary sidebar tree', () => {
   });
   it('supports collapse, expand and browser history between settings subpages', async () => {
     render(<MemoryRouter initialEntries={['/settings/sources']}><App /><HistoryControls /></MemoryRouter>);
-    await screen.findByRole('checkbox', { name: '启用 Semantic Scholar' });
+    await screen.findByRole('switch', { name: '启用 Semantic Scholar' });
     await userEvent.click(screen.getByRole('button', { name: '设置' }));
     expect(screen.queryByRole('link', { name: '模型与密钥' })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: '设置' }));
@@ -147,17 +195,17 @@ describe('settings primary sidebar tree', () => {
   });
   it('redirects the old settings entry to sources and handles unknown sections', async () => {
     const view = render(<MemoryRouter initialEntries={['/settings']}><App /><HistoryControls /></MemoryRouter>);
-    await screen.findByRole('checkbox', { name: '启用 Semantic Scholar' });
+    await screen.findByRole('switch', { name: '启用 Semantic Scholar' });
     expect(screen.getByLabelText('当前地址')).toHaveTextContent('/settings/sources'); view.unmount();
     render(<MemoryRouter initialEntries={['/settings/unknown']}><App /><HistoryControls /></MemoryRouter>);
-    await screen.findByRole('checkbox', { name: '启用 Semantic Scholar' });
+    await screen.findByRole('switch', { name: '启用 Semantic Scholar' });
     expect(screen.getByLabelText('当前地址')).toHaveTextContent('/settings/sources');
   });
   it('keeps unsaved values while switching settings sections', async () => {
-    const user = await mount(); await user.click(screen.getByRole('checkbox', { name: '启用 Semantic Scholar' }));
+    const user = await mount(); await user.click(screen.getByRole('switch', { name: '启用 Semantic Scholar' }));
     await user.click(screen.getByRole('link', { name: '模型与密钥' }));
     await user.click(screen.getByRole('link', { name: '数据源' }));
-    expect(screen.getByRole('checkbox', { name: '启用 Semantic Scholar' })).not.toBeChecked();
+    expect(screen.getByRole('switch', { name: '启用 Semantic Scholar' })).not.toBeChecked();
     expect(screen.getByRole('button', { name: '保存设置' })).toBeEnabled(); expect(writes()).toHaveLength(0);
   });
   it('closes the mobile drawer after choosing a child and on Escape', async () => {

@@ -1,18 +1,116 @@
-import { useState } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
-import { ArrowUpRight, Download, FileText, Plus, RefreshCw, Trash2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { ArrowUpRight, Download, FileText, Plus, RefreshCw, Trash2, X } from 'lucide-react';
 import { download, errorMessage, request, useResource } from '../api';
 import type { Page, Task } from '../types';
 import { dateTime, executionLabels, ExecutionBadge, ModeBadge, queryString } from '../format';
 import { UploadDialog } from '../components/UploadDialog';
-import { Button, EmptyState, InlineError, Loading, Modal, PageHeader, Pagination, SearchInput, useToast } from '../components/ui';
+import { ActionMenu, Button, EmptyState, InlineError, Loading, Modal, PageHeader, Pagination, SearchInput, Select, useToast } from '../components/ui';
+import './tables.css';
 
 export default function TaskList() {
-  const [params, setParams] = useSearchParams(); const [upload, setUpload] = useState(false); const [deleting, setDeleting] = useState<Task | null>(null); const [busy, setBusy] = useState(false); const toast = useToast();
-  const q = params.get('q') ?? ''; const status = params.get('status') ?? ''; const sort = params.get('sort') ?? 'created_desc'; const page = Math.max(1, Number(params.get('page') ?? 1)); const size = Number(params.get('size') ?? 10);
-  const set = (values: Record<string, string | number>) => { const next = new URLSearchParams(params); Object.entries(values).forEach(([k, v]) => { if (v === '') next.delete(k); else next.set(k, String(v)); }); if (!('page' in values)) next.set('page', '1'); setParams(next, { replace: true }); };
-  const { data, loading, error, refresh } = useResource<Page<Task>>(`/tasks?${queryString({ q, execution_status: status, sort, page, page_size: size })}`, true);
-  const remove = async () => { if (!deleting || busy) return; setBusy(true); try { await request(`/tasks/${deleting.id}`, { method: 'DELETE' }); setDeleting(null); toast('已删除本次任务；共享文献知识保留。'); refresh(); } catch (e) { toast(errorMessage(e), true); } finally { setBusy(false); } };
-  const saveReport = async (task: Task) => { try { await download(task.report_url, `${task.name}.report.json`); } catch (e) { toast(errorMessage(e), true); } };
-  return <><PageHeader title="Bib 核查任务" actions={<Button variant="primary" onClick={() => setUpload(true)}><Plus size={16} />上传 Bib 文件</Button>} /><div className="toolbar"><SearchInput value={q} onChange={value => set({ q: value })} placeholder="搜索任务名称、文件名…" label="搜索任务" /><select aria-label="执行状态筛选" value={status} onChange={e => set({ status: e.target.value })}><option value="">全部执行状态</option>{Object.entries(executionLabels).map(([key, value]) => <option value={key} key={key}>{value}</option>)}</select><select aria-label="任务排序" value={sort} onChange={e => set({ sort: e.target.value })}><option value="created_desc">创建时间 · 最新</option><option value="created_asc">创建时间 · 最早</option><option value="updated_desc">最近更新</option></select><span className="toolbar-spacer" /><Button variant="ghost" onClick={refresh} aria-label="刷新任务"><RefreshCw size={15} /></Button></div>{error && <InlineError error={error} retry={refresh} />}{loading && !data ? <Loading /> : data && data.items.length > 0 ? <><div className="table-wrap"><table className="task-table"><caption className="sr-only">按上传文件组织的独立核查任务</caption><thead><tr><th>任务名称</th><th>文件名</th><th>条目</th><th>执行状态</th><th>结果待关注</th><th>创建时间</th><th className="hide-tablet">更新时间</th><th className="nowrap" style={{ textAlign: 'right' }}>操作</th></tr></thead><tbody>{data.items.map(task => <tr key={task.id}><td><div className="row-primary"><span className="file-icon"><FileText size={16} /></span><div><Link className="row-title" to={`/tasks/${task.id}`}>{task.name || task.filename}</Link><div className="row-subtitle"><ModeBadge mode={task.mode} /></div></div></div></td><td className="muted">{task.filename}</td><td>{task.summary.total}</td><td><ExecutionBadge status={task.execution_status} /></td><td><span className={task.summary.problem_entries ? 'inline-value' : 'muted'}>{task.summary.problem_entries ? `${task.summary.problem_entries} 条` : '—'}</span></td><td className="muted nowrap">{dateTime(task.created_at)}</td><td className="muted nowrap hide-tablet">{dateTime(task.updated_at)}</td><td><div className="row-actions"><Link className="button compact" to={`/tasks/${task.id}`}>查看<ArrowUpRight size={12} /></Link><Button variant="ghost" className="compact" aria-label={`下载 ${task.name} 报告`} onClick={() => void saveReport(task)}><Download size={13} /></Button><Button variant="ghost" className="compact" aria-label={`删除 ${task.name}`} onClick={() => setDeleting(task)}><Trash2 size={13} /></Button></div></td></tr>)}</tbody></table></div><Pagination page={page} size={size} total={data.total} onPage={value => set({ page: value })} onSize={value => set({ size: value })} /></> : !error && <div className="panel"><EmptyState title={q || status ? '没有匹配的任务' : '从第一份 Bib 开始'} action={<Button variant="primary" onClick={() => setUpload(true)}><Plus size={15} />上传 Bib 文件</Button>}>{q || status ? '试试调整搜索或执行状态筛选。' : ''}</EmptyState></div>}{upload && <UploadDialog onClose={() => setUpload(false)} />}{deleting && <Modal title="删除这次核查任务？" onClose={() => { if (!busy) setDeleting(null); }}><div className="modal-body"><p>将删除 <strong>{deleting.name}</strong> 的任务记录与上传文件。共享文献知识不会删除，其他任务不受影响。</p><p className="muted small" style={{ marginTop: 12 }}>此操作不可撤销。</p></div><div className="modal-actions"><Button disabled={busy} onClick={() => setDeleting(null)}>取消</Button><Button variant="danger" disabled={busy} onClick={() => void remove()}>{busy ? '删除中…' : '仅删除本次任务'}</Button></div></Modal>}</>;
+  const navigate = useNavigate();
+  const [params, setParams] = useSearchParams();
+  const [upload, setUpload] = useState(false);
+  const [deleting, setDeleting] = useState<Task | null>(null);
+  const [busy, setBusy] = useState(false);
+  const toast = useToast();
+  const q = params.get('q') ?? '';
+  const status = params.get('status') ?? '';
+  const sort = params.get('sort') ?? 'created_desc';
+  const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+  const requestedSize = Number(params.get('size') ?? 10);
+  const size = [10, 20, 50].includes(requestedSize) ? requestedSize : 10;
+  const filtered = Boolean(q || status);
+
+  const set = (values: Record<string, string | number>) => {
+    const next = new URLSearchParams(params);
+    Object.entries(values).forEach(([key, value]) => {
+      if (value === '') next.delete(key); else next.set(key, String(value));
+    });
+    if (!('page' in values)) next.set('page', '1');
+    setParams(next, { replace: true });
+  };
+  const { data, loading, error, refresh } = useResource<Page<Task>>(
+    `/tasks?${queryString({ q, execution_status: status, sort, page, page_size: size })}`, true,
+  );
+  useEffect(() => {
+    if (!data || loading) return;
+    const lastPage = Math.max(1, Math.ceil(data.total / size));
+    if (page <= lastPage) return;
+    const next = new URLSearchParams(params);
+    next.set('page', String(lastPage));
+    setParams(next, { replace: true });
+  }, [data, loading, page, size, params, setParams]);
+  const remove = async () => {
+    if (!deleting || busy) return;
+    setBusy(true);
+    try {
+      await request(`/tasks/${deleting.id}`, { method: 'DELETE' });
+      setDeleting(null);
+      toast('已删除本次任务；共享文献知识保留。');
+      refresh();
+    } catch (e) { toast(errorMessage(e), true); }
+    finally { setBusy(false); }
+  };
+  const save = async (path: string, filename: string) => {
+    try { await download(path, filename); }
+    catch (e) { toast(errorMessage(e), true); }
+  };
+
+  return <div className="admin-table-page">
+    <PageHeader title="Bib 核查任务" actions={
+      <Button variant="primary" onClick={() => setUpload(true)}><Plus size={16} />上传 Bib 文件</Button>
+    } />
+    <div className="data-table-toolbar" role="toolbar" aria-label="任务筛选">
+      <div className="data-table-filters">
+        <SearchInput value={q} onChange={value => set({ q: value })} placeholder="搜索任务、文件名…" label="搜索任务" />
+        <Select aria-label="执行状态筛选" value={status} onValueChange={value => set({ status: value })}
+          options={[{ value: '', label: '全部状态' }, ...Object.entries(executionLabels).map(([value, label]) => ({ value, label }))]} />
+        {filtered && <Button variant="ghost" className="filter-reset" onClick={() => set({ q: '', status: '' })}>重置<X size={14} /></Button>}
+      </div>
+      <div className="data-table-tools">
+        <Select aria-label="任务排序" value={sort} onValueChange={value => set({ sort: value })}
+          options={[{ value: 'created_desc', label: '创建时间 · 最新' }, { value: 'created_asc', label: '创建时间 · 最早' }, { value: 'updated_desc', label: '最近更新' }]} />
+        <Button variant="ghost" className="icon-button" onClick={refresh} aria-label="刷新任务"><RefreshCw size={16} /></Button>
+      </div>
+    </div>
+    {error && <InlineError error={error} retry={refresh} />}
+    {loading && !data ? <Loading /> : data && data.items.length > 0 ? <>
+      <div className="table-wrap admin-data-table">
+        <table className="task-table">
+          <caption className="sr-only">按上传文件组织的独立核查任务</caption>
+          <thead><tr><th>任务</th><th>核查方式</th><th className="numeric-cell">条目</th><th>执行状态</th><th className="numeric-cell">待关注</th><th>创建时间</th><th className="hide-tablet">更新时间</th><th className="menu-cell"><span className="sr-only">操作</span></th></tr></thead>
+          <tbody>{data.items.map(task => <tr key={task.id}>
+            <td className="task-name-cell"><div className="row-primary"><span className="file-icon"><FileText size={17} /></span><div>
+              <Link className="row-title" to={`/tasks/${task.id}`}>{task.name || task.filename}</Link>
+              <div className="table-cell-secondary">{task.filename}</div>
+            </div></div></td>
+            <td><ModeBadge mode={task.mode} /></td>
+            <td className="numeric-cell">{task.summary.total}</td>
+            <td><ExecutionBadge status={task.execution_status} /></td>
+            <td className="numeric-cell"><span className={task.summary.problem_entries ? 'attention-count' : 'muted'}>{task.summary.problem_entries || '—'}</span></td>
+            <td className="table-date">{dateTime(task.created_at)}</td>
+            <td className="table-date hide-tablet">{dateTime(task.updated_at)}</td>
+            <td className="menu-cell"><ActionMenu label={`操作 ${task.name}`} items={[
+              { label: '查看任务', icon: <ArrowUpRight size={15} />, onSelect: () => navigate(`/tasks/${task.id}`) },
+              { label: '下载原件', icon: <Download size={15} />, onSelect: () => void save(task.original_url, task.filename) },
+              { label: '导出报告', icon: <FileText size={15} />, onSelect: () => void save(task.report_url, `${task.name}.report.json`) },
+              { label: '删除任务', icon: <Trash2 size={15} />, destructive: true, onSelect: () => setDeleting(task) },
+            ]} /></td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+      <Pagination page={page} size={size} total={data.total} onPage={value => set({ page: value })} onSize={value => set({ size: value })} />
+    </> : !error && <div className="panel table-empty">
+      <EmptyState title={filtered ? '没有匹配的任务' : '从第一份 Bib 开始'} action={filtered
+        ? <Button onClick={() => set({ q: '', status: '' })}>清除筛选</Button>
+        : <Button variant="primary" onClick={() => setUpload(true)}><Plus size={15} />上传 Bib 文件</Button>} />
+    </div>}
+    {upload && <UploadDialog onClose={() => setUpload(false)} />}
+    {deleting && <Modal title="删除这次核查任务？" onClose={() => { if (!busy) setDeleting(null); }}>
+      <div className="modal-body"><p>将删除 <strong>{deleting.name}</strong> 的任务记录与上传文件。共享文献知识和其他任务保留。</p><p className="delete-warning">此操作不可撤销。</p></div>
+      <div className="modal-actions"><Button disabled={busy} onClick={() => setDeleting(null)}>取消</Button><Button variant="danger" disabled={busy} onClick={() => void remove()}>{busy ? '删除中…' : '仅删除本次任务'}</Button></div>
+    </Modal>}
+  </div>;
 }
