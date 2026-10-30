@@ -1,7 +1,7 @@
 """Deterministic source/transport tests. No DNS, remote API or paid model calls."""
 import asyncio
 import json
-import time
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -261,14 +261,24 @@ async def test_invalid_provider_response_does_not_drop_other_sources():
     assert any(e["provider"] == "crossref" and e["status"] == "error" for e in events)
 
 
-async def test_error_is_not_negative_cache_but_empty_has_short_ttl():
+async def test_error_is_not_negative_cache_but_empty_has_short_ttl(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(sources, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     net = Network(lambda url: (503, {}))
     _, events, registry = await lookup(net)
     assert not registry._cache and any(e["status"] == "error" for e in events)
     net.handler = lambda url: (200, {"message": {"items": []}})
     _, events, registry = await lookup(net, registry=registry)
     assert any(e["status"] == "empty" for e in events)
-    assert all(expiry - time.monotonic() <= 60 for expiry, _ in registry._cache.values())
+    assert registry._cache
+    assert all(expiry == 1060.0 for expiry, _ in registry._cache.values())
+    requests = len(net.calls)
+    clock[0] = 1059.0
+    await lookup(net, registry=registry)
+    assert len(net.calls) == requests
+    clock[0] = 1060.0
+    await lookup(net, registry=registry)
+    assert len(net.calls) == requests + 1
 
 
 async def test_malformed_json_is_not_cached():

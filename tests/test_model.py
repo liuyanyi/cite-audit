@@ -10,7 +10,7 @@ from cite_audit import model
 
 def config(protocol="openai-chat", **extra):
     return {"enabled": True, "protocol": protocol, "model": "offline-test", "api_key": "test-only-secret",
-            "base_url": "https://provider.example/v1", "max_retries": 0, "timeout_seconds": 5,
+            "base_url": "https://provider.example/v1", "max_retries": 0, "timeout_seconds": 30,
             "max_output_tokens": 50, **extra}
 
 
