@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cite-audit-remake"
+version = "0.1.0"
+description = "Evidence-first BibTeX auditing with isolated tasks and publication versions"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.34,<1",
+  "httpx>=0.28,<1",
+  "httpx2>=2.16,<3",
+  "mmsp==0.5.6",
+  "python-multipart>=0.0.20,<1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3,<10", "pytest-asyncio>=0.25,<2", "ruff>=0.11,<1"]
+
+[project.scripts]
+cite-audit = "cite_audit.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cite_audit"]
+
+[tool.hatch.build]
+artifacts = ["cite_audit/static/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 110

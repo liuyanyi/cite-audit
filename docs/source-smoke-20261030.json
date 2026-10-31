@@ -1,0 +1,61 @@
+{
+  "checked_at_utc": "2026-10-30",
+  "result": "blocked_before_http",
+  "description": "All six source probes failed during DNS resolution. No online metadata was verified.",
+  "providers": [
+    {
+      "provider": "crossref",
+      "record_count": 0,
+      "status": "dns_resolution_failed",
+      "error_type": "socket.gaierror",
+      "attempted_urls": [
+        "https://api.crossref.org/works/10.18653/v1/n19-1423"
+      ]
+    },
+    {
+      "provider": "arxiv",
+      "record_count": 0,
+      "status": "dns_resolution_failed",
+      "error_type": "socket.gaierror",
+      "attempted_urls": [
+        "https://export.arxiv.org/api/query?max_results=3&id_list=1810.04805"
+      ]
+    },
+    {
+      "provider": "openalex",
+      "record_count": 0,
+      "status": "dns_resolution_failed",
+      "error_type": "socket.gaierror",
+      "attempted_urls": [
+        "https://api.openalex.org/works/https://doi.org/10.18653/v1/n19-1423"
+      ]
+    },
+    {
+      "provider": "semantic_scholar",
+      "record_count": 0,
+      "status": "dns_resolution_failed",
+      "error_type": "socket.gaierror",
+      "attempted_urls": [
+        "https://api.semanticscholar.org/graph/v1/paper/DOI%3A10.18653%2Fv1%2Fn19-1423?fields=paperId%2Ctitle%2Cauthors%2Cyear%2Cvenue%2CexternalIds%2Curl%2CopenAccessPdf%2CpublicationVenue"
+      ]
+    },
+    {
+      "provider": "acl",
+      "record_count": 0,
+      "status": "dns_resolution_failed",
+      "error_type": "socket.gaierror",
+      "attempted_urls": [
+        "https://aclanthology.org/N19-1423.bib"
+      ]
+    },
+    {
+      "provider": "pmlr",
+      "record_count": 0,
+      "status": "dns_resolution_failed",
+      "error_type": "socket.gaierror",
+      "attempted_urls": [
+        "https://proceedings.mlr.press/v139/radford21a.html"
+      ]
+    }
+  ]
+}
