@@ -4,7 +4,7 @@
 
 英文使用 Inter，中文使用 Noto Sans SC；通过官方 Google Fonts CSS2 请求 400–700 可变字重，使用 Unicode 分片、display=swap 和系统字体回退。保留代码等宽字体及表单控件字体继承，未新增字体二进制依赖或改变业务逻辑。许可与来源见 frontend/THIRD_PARTY_NOTICES.md。
 
-165 项后端测试、45 项前端测试、Ruff、TypeScript、前端构建和 wheel 安装 smoke 通过。实际浏览器已确认新版字体链接和字体栈，回退文字可读；但该环境访问官方 CSS2 地址返回 net::ERR_BLOCKED_BY_CLIENT，FontFaceSet 为空，因此未验证 CDN 字体下载或实际 Inter / Noto 字形。未更改浏览器或网络安全策略，也未把回退字体截图当作新字体验收。
+165 项后端测试、45 项前端测试、Ruff、TypeScript、前端构建和 wheel 安装 smoke 通过。实际浏览器已确认新版字体链接和字体栈，回退文字可读；但该环境直接访问官方 CSS2 地址返回 net::ERR_BLOCKED_BY_CLIENT，具体拦截规则未暴露。受限页面观察接口不足以确认浏览器实际使用的字体，因此 CDN 字体下载及实际 Inter / Noto 字形仍未验证；独立 HTTP 请求能正常取得官方字体 CSS。未更改浏览器或网络安全策略，也未把回退字体截图当作新字体验收。
 
 ## 数据源紧凑表格（2026-10-31）
 
