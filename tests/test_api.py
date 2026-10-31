@@ -1,6 +1,7 @@
 import asyncio
 import json
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,7 +14,13 @@ RAW = ('% untouched comment\r\n@article{bert, title={' + BERT_TITLE + '}, author
 
 
 @pytest.fixture
-def service(tmp_path):
+def service(tmp_path, monkeypatch):
+    # These API tests model a newly captured demo response, not the historical
+    # fixture capture date. Tests of expiry override this timestamp explicitly.
+    records = deepcopy(MOCK_BERT_RECORDS)
+    for record in records:
+        record["fetched_at"] = datetime.now(UTC).isoformat()
+    monkeypatch.setattr("cite_audit.sources.MOCK_BERT_RECORDS", records)
     return AuditService(tmp_path)
 
 
@@ -24,7 +31,16 @@ async def completed(service, raw=RAW):
 
 
 @pytest.mark.asyncio
-async def test_full_flow_frozen_report_new_upload_and_export(service):
+@pytest.mark.parametrize("evidence_age_seconds,expect_cache_hit", [(0, True), (86401, False)])
+async def test_full_flow_frozen_report_new_upload_and_export(service, monkeypatch, evidence_age_seconds,
+                                                         expect_cache_hit):
+    # Fixture capture dates are historical, so wall-clock passage must not decide
+    # whether this test expects reusable evidence. Exercise both TTL branches.
+    records = deepcopy(MOCK_BERT_RECORDS)
+    captured_at = (datetime.now(UTC) - timedelta(seconds=evidence_age_seconds)).isoformat()
+    for record in records:
+        record["fetched_at"] = captured_at
+    monkeypatch.setattr("cite_audit.sources.MOCK_BERT_RECORDS", records)
     task = await completed(service)
     assert task['execution_status'] == 'completed'
     entry = service.entries(task['id'], True)[0]
@@ -51,7 +67,7 @@ async def test_full_flow_frozen_report_new_upload_and_export(service):
     assert second['id'] != task['id'] and second['execution_status'] == 'queued'
     assert second['summary']['confirmed'] == 0
     await service.run_task(second['id'])
-    assert any(c['cache_hit'] for c in service.calls(second['id']))
+    assert any(c['cache_hit'] for c in service.calls(second['id'])) is expect_cache_hit
     updated = deepcopy(MOCK_BERT_RECORDS[1]); updated['raw_payload']={'revision':99}; updated['fields']['pages']='1--2'
     service.knowledge.ingest([updated], 'mock')
     assert service.freeze(task['id']) == frozen
@@ -174,7 +190,9 @@ async def test_recent_complement_does_not_refresh_old_evidence(service):
     task=await completed(service)
     frozen=service.freeze(task['id'])
     source_id=service.knowledge.article(service.entries(task['id'])[0]['article_id'])['versions'][0]['sources'][0]['id']
-    service.store.execute('UPDATE source_checks SET checked_at=? WHERE source_id=?', ('2000-01-01T00:00:00+00:00',source_id))
+    assert service.reusable_sources({'eprint':'1810.04805'},'demo',86400)
+    expired_at = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+    service.store.execute('UPDATE source_checks SET checked_at=? WHERE source_id=?', (expired_at,source_id))
     assert service.knowledge.source(source_id)['stale']
     assert service.reusable_sources({'eprint':'1810.04805'},'demo',86400)==[]
     assert service.freeze(task['id'])==frozen

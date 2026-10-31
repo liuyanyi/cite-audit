@@ -30,6 +30,27 @@ const posts = () => fetchMock.mock.calls.filter(call => call[1]?.method === 'POS
 const deletes = () => fetchMock.mock.calls.filter(call => call[1]?.method === 'DELETE');
 
 describe('settings configuration and confirmations', () => {
+  it('renders one compact row per source with a trailing configuration dialog action', async () => {
+    fetchMock.mockImplementation(async () => reply({ ...fixture, sources: [fixture.sources[0], { ...fixture.sources[0], id: 'crossref', name: 'Crossref', supports_api_key: false, has_api_key: false }] }));
+    const user = await mount();
+    const table = screen.getByRole('table', { name: '数据源配置' });
+    expect(within(table).getAllByRole('row')).toHaveLength(3);
+    expect(within(table).getAllByRole('columnheader').map(header => header.textContent)).toEqual(['数据源', '启用', '连接状态', '密钥', '操作']);
+    for (const name of ['Semantic Scholar', 'Crossref']) {
+      const row = within(table).getByRole('row', { name });
+      expect(within(row).getByRole('rowheader')).toHaveTextContent(name);
+      const lastCell = within(row).getAllByRole('cell').at(-1)!;
+      const actions = within(lastCell).getAllByRole('button');
+      expect(actions.at(-1)).toHaveAccessibleName(`配置 ${name}`);
+      await user.click(actions.at(-1)!);
+      expect(screen.getByRole('dialog')).toHaveAccessibleName(`配置 ${name}`);
+      await user.keyboard('{Escape}');
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      await waitFor(() => expect(actions.at(-1)).toHaveFocus());
+    }
+    expect(writes()).toHaveLength(0);
+    expect(posts()).toHaveLength(0);
+  });
   it('omits unchanged keys and read-only presence fields when saving', async () => {
     const user = await mount();
     await user.click(screen.getByRole('switch', { name: '启用 Semantic Scholar' }));
@@ -122,29 +143,29 @@ describe('settings configuration and confirmations', () => {
     await user.click(screen.getByRole('button', { name: '配置 Semantic Scholar' }));
     expect(screen.getByLabelText('更换 Semantic Scholar 密钥')).toHaveValue('');
   });
-  it('filters integration cards by source name without changing configuration', async () => {
+  it('filters source rows by source name without changing configuration', async () => {
     const user = await mount();
     await user.type(screen.getByRole('textbox', { name: '搜索数据源' }), 'Crossref');
-    expect(screen.queryByRole('article', { name: 'Semantic Scholar' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('row', { name: 'Semantic Scholar' })).not.toBeInTheDocument();
     expect(screen.getByText('没有匹配的数据源')).toBeVisible();
     await user.click(screen.getByRole('button', { name: '清除搜索' }));
-    expect(screen.getByRole('article', { name: 'Semantic Scholar' })).toBeVisible();
+    expect(screen.getByRole('row', { name: 'Semantic Scholar' })).toBeVisible();
     expect(writes()).toHaveLength(0);
   });
-  it('filters cards with the enabled-state Radix select', async () => {
+  it('filters rows with the enabled-state Radix select', async () => {
     const user = await mount();
     await user.click(screen.getByRole('combobox', { name: '数据源启用筛选' }));
     await user.click(screen.getByRole('option', { name: /^未启用$/ }));
     expect(screen.getByText('没有匹配的数据源')).toBeVisible();
     await user.click(screen.getByRole('combobox', { name: '数据源启用筛选' }));
     await user.click(screen.getByRole('option', { name: /^已启用$/ }));
-    expect(screen.getByRole('article', { name: 'Semantic Scholar' })).toBeVisible();
+    expect(screen.getByRole('row', { name: 'Semantic Scholar' })).toBeVisible();
     expect(screen.getByRole('button', { name: '保存设置' })).toBeDisabled();
   });
   it('shows unavailable integrations without enabling fake actions', async () => {
     fetchMock.mockImplementation(async () => reply({ ...fixture, sources: [{ ...fixture.sources[0], enabled: false, implemented: false, has_api_key: false, status: 'not_implemented' }] }));
     await mount();
-    const card = within(screen.getByRole('article', { name: 'Semantic Scholar' }));
+    const card = within(screen.getByRole('row', { name: 'Semantic Scholar' }));
     expect(card.getByText('尚未接入')).toBeVisible();
     expect(card.getByRole('switch', { name: '启用 Semantic Scholar' })).toBeDisabled();
     expect(card.getByRole('switch', { name: '启用 Semantic Scholar' })).not.toBeChecked();

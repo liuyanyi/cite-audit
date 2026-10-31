@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { KeyRound, PlugZap, Save, SlidersHorizontal, Trash2 } from 'lucide-react';
+import { PlugZap, Save, SlidersHorizontal, Trash2 } from 'lucide-react';
 import { Navigate, useParams } from 'react-router-dom';
 import { settingsSections } from '../settingsNavigation';
 import { errorMessage, json, request, useResource } from '../api';
@@ -9,7 +9,6 @@ import { Badge, Button, Checkbox, EmptyState, InlineError, Loading, Modal, PageH
 import CallTable from '../components/CallTable';
 import './settings.css';
 
-const sourceIdentity: Record<string, { mark: string; scope: string }> = { crossref: { mark: 'Cr', scope: 'DOI 注册与出版元数据' }, arxiv: { mark: 'arX', scope: '预印本与版本记录' }, openalex: { mark: 'OA', scope: '开放学术索引' }, semantic_scholar: { mark: 'S²', scope: '论文与出版关系索引' }, acl: { mark: 'ACL', scope: '计算语言学官方论文集' }, acl_anthology: { mark: 'ACL', scope: '计算语言学官方论文集' }, pmlr: { mark: 'PMLR', scope: '机器学习官方论文集' } };
 const statusLabels: Record<string, string> = { not_tested: '未测试', available: '可访问', unavailable: '不可访问', needs_key: '需要密钥', not_implemented: '尚未接入' };
 type Confirmation = { kind: 'model' } | { kind: 'source'; id: string; name: string } | { kind: 'cache' };
 
@@ -84,15 +83,22 @@ export default function SettingsPage() {
         {dirty && <div className="notice warning compact">请先保存更改，再测试连接。</div>}
         {section === 'sources' && <section aria-label="数据源集成" className="integration-module">
           <div className="integration-toolbar"><SearchInput value={sourceSearch} onChange={setSourceSearch} label="搜索数据源" placeholder="搜索数据源…" /><Select aria-label="数据源启用筛选" value={sourceFilter} onValueChange={setSourceFilter} options={[{ value: 'all', label: '全部数据源' }, { value: 'enabled', label: '已启用' }, { value: 'disabled', label: '未启用' }]} /><span className="integration-count">{draft.sources.filter(source => source.enabled).length} / {draft.sources.length} 已启用</span></div>
-          <div className="integration-grid">{sources.map(source => {
-            const identity = sourceIdentity[source.id] ?? { mark: source.name.slice(0, 2), scope: source.capabilities.join(' · ') };
-            const status = testedSources[source.id] || source.status;
-            return <article className="integration-card" key={source.id} aria-label={providerNames[source.id] || source.name}>
-              <div className="integration-card-top"><span className={`integration-mark mark-${source.id}`} aria-hidden="true">{identity.mark}</span><Switch aria-label={`启用 ${source.name}`} disabled={!source.implemented || busy} checked={source.enabled} onCheckedChange={checked => change(current => ({ ...current, sources: current.sources.map(item => item.id === source.id ? { ...item, enabled: checked } : item) }))} /></div>
-              <div className="integration-card-body"><h3>{providerNames[source.id] || source.name}</h3><p>{identity.scope}</p><div className="integration-card-status"><Badge tone={status === 'available' ? 'success' : status === 'unavailable' ? 'danger' : 'neutral'}>{statusLabels[status] || status}</Badge>{source.requires_key && !source.has_api_key && <span className="key-required"><KeyRound size={12} />需要密钥</span>}{source.has_api_key && supportsKey(source) && <span className="muted"><KeyRound size={12} />已配置</span>}</div></div>
-              <div className="integration-card-footer"><Button disabled={busy || dirty || !source.implemented} onClick={() => setConfirmation({ kind: 'source', id: source.id, name: source.name })}><PlugZap size={14} />测试连接</Button><Button disabled={busy || !source.implemented} aria-label={`配置 ${source.name}`} onClick={() => setSourceEditor({ ...source })}><SlidersHorizontal size={14} />配置</Button></div>
-            </article>;
-          })}</div>{!sources.length && <EmptyState title="没有匹配的数据源" />}
+          <div className="table-wrap integration-table-wrap" role="region" aria-label="数据源配置表格" tabIndex={0}>
+            <table className="integration-table"><caption className="sr-only">数据源配置</caption>
+              <thead><tr><th scope="col">数据源</th><th scope="col">启用</th><th scope="col">连接状态</th><th scope="col">密钥</th><th scope="col" className="integration-actions-heading">操作</th></tr></thead>
+              <tbody>{sources.map(source => {
+                const status = testedSources[source.id] || source.status;
+                const keyStatus = source.api_key === '' ? '保存后清除' : source.api_key ? '待保存' : source.has_api_key ? '已配置' : source.requires_key ? '需要密钥' : '未设置';
+                return <tr key={source.id} aria-label={providerNames[source.id] || source.name}>
+                  <th scope="row">{providerNames[source.id] || source.name}</th>
+                  <td><Switch aria-label={`启用 ${source.name}`} disabled={!source.implemented || busy} checked={source.enabled} onCheckedChange={checked => change(current => ({ ...current, sources: current.sources.map(item => item.id === source.id ? { ...item, enabled: checked } : item) }))} /></td>
+                  <td><Badge tone={status === 'available' ? 'success' : status === 'unavailable' ? 'danger' : 'neutral'}>{statusLabels[status] || status}</Badge></td>
+                  <td className={source.requires_key && !source.has_api_key ? 'key-required' : 'muted'}>{supportsKey(source) ? keyStatus : '—'}</td>
+                  <td><div className="integration-row-actions"><Button disabled={busy || dirty || !source.implemented} onClick={() => setConfirmation({ kind: 'source', id: source.id, name: source.name })}><PlugZap size={14} />测试连接</Button><Button disabled={busy || !source.implemented} aria-label={`配置 ${source.name}`} onClick={() => setSourceEditor({ ...source })}><SlidersHorizontal size={14} />配置</Button></div></td>
+                </tr>;
+              })}</tbody>
+            </table>{!sources.length && <EmptyState title="没有匹配的数据源" />}
+          </div>
         </section>}
         {section === 'model' && <section className="settings-form-module" aria-labelledby="model-heading">
           <div className="settings-module-heading"><div><h2 id="model-heading">模型连接</h2><p>仅连接测试，核查流程尚未接入。</p></div><Switch aria-label="启用模型测试" checked={draft.model.enabled} onCheckedChange={checked => change(current => ({ ...current, model: { ...current.model, enabled: checked } }))} /></div>
