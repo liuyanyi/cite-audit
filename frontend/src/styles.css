@@ -1,6 +1,6 @@
 /* Neutral CMS tokens shared by every page and Radix primitive. */
 :root {
-  font-family: Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+  font-family:"Inter","Noto Sans SC",-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
   color:var(--text);background:var(--background);font-synthesis:none;text-rendering:optimizeLegibility;-webkit-font-smoothing:antialiased;
   --background:#fff;--surface:#fff;--sidebar:#fafafa;--text:#18181b;--muted:#71717a;--border:#e4e4e7;--hover:#f4f4f5;--selected:#ededf0;
   --link:#2563eb;--success:#15803d;--success-bg:#f0fdf4;--warning:#a16207;--warning-bg:#fffbeb;--danger:#b91c1c;--danger-bg:#fef2f2;

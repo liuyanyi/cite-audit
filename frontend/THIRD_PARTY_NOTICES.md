@@ -25,3 +25,18 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Web fonts — SIL Open Font License 1.1
+
+[Inter](https://github.com/google/fonts/tree/main/ofl/inter) and
+[Noto Sans SC](https://github.com/google/fonts/tree/main/ofl/notosanssc) are
+loaded from the Google Fonts CSS2 CDN. Both are licensed under the SIL Open
+Font License 1.1; see their upstream [Inter license](https://github.com/google/fonts/blob/main/ofl/inter/OFL.txt)
+and [Noto Sans SC license](https://github.com/google/fonts/blob/main/ofl/notosanssc/OFL.txt).
+No font binaries are bundled or modified.
+
+The request uses variable weights 400–700 (including the UI's 550/650 weights),
+`display=swap`, and the CDN's Unicode-range subsets rather than a full Chinese
+font download. User text is never sent as a font-subsetting parameter. System
+sans-serif fallbacks remain available when the CDN cannot be reached; code
+and BibTeX retain their separate monospace stack.
