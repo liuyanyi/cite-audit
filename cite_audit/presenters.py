@@ -62,7 +62,8 @@ def article(data, detail=True):
     item["mode"] = "demo" if item.pop("namespace") == "mock" else "online"
     item["recommendation_reason"] = rec["reason"]
     item["recommendation_revision"] = rec["revision"]
-    item["updated_at"] = max((v["updated_at"] for v in item["versions"]), default=item["created_at"])
+    item["updated_at"] = item.get("updated_at") or max(
+        (v["updated_at"] for v in item.get("versions", [])), default=item["created_at"])
     item.pop("recommended_version", None)
     if detail:
         relations = {r["id"]: relation(r) for v in item["versions"] for r in v["relations"]}

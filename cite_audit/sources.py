@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import html
 import http.client
 import ipaddress
 import json
@@ -31,16 +32,23 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
-from typing import Any, ClassVar
+from typing import Any
 from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit
 
-PROVIDERS = ("crossref", "arxiv", "openalex", "semantic_scholar", "acl", "pmlr")
+from .assessment import current_match
+from .journals import issns
+from .knowledge import publication_type
+from .matching import iclr_paper_id, names, openreview_id, plain_title, relevance
+from .policy import CREDENTIAL_PROVIDERS, NEGATIVE_TTL_SECONDS, PROVIDERS, SETTING_LIMITS
+from .settings import redact, secrets_from
+
 ALLOWED_HOSTS = frozenset({
-    "api.crossref.org", "export.arxiv.org", "arxiv.org", "api.openalex.org",
-    "api.semanticscholar.org", "aclanthology.org", "proceedings.mlr.press",
+    "jmlr.org", "api2.openreview.net", "api.crossref.org", "export.arxiv.org", "arxiv.org", "api.openalex.org",
+    "api.semanticscholar.org", "aclanthology.org", "proceedings.mlr.press", "proceedings.iclr.cc",
 })
-MIN_INTERVAL = {"crossref": 0.25, "arxiv": 3.0, "openalex": 0.2,
+MIN_INTERVAL = {"iclr": 0.5, "openreview": 1.0, "tmlr": 0.5, "crossref": 0.25, "arxiv": 3.0, "openalex": 0.2,
                 "semantic_scholar": 1.0, "acl": 0.5, "pmlr": 0.5}
 MAX_BYTES = 2_000_000
 MAX_CACHE_BYTES = 16_000_000
@@ -132,6 +140,24 @@ class Response:
     body: bytes
     url: str
     fetched_at: str = ""
+
+
+def _response_summary(response: Response, settings: dict) -> dict:
+    # Audit previews are bounded plain text, never executable HTML/TeX.
+    limit = 32_000
+    text = response.body.decode("utf-8", errors="replace")
+    try:
+        text = json.dumps(redact(json.loads(text), secrets_from(settings)), ensure_ascii=False)
+    except ValueError:
+        text = redact(text, secrets_from(settings))
+    return {"url": response.url, "http_status": response.status, "fetched_at": response.fetched_at,
+            "byte_size": len(response.body), "body": text[:limit], "truncated": len(text) > limit}
+
+
+def _result_summary(records: list) -> dict:
+    return {"record_count": len(records), "records": [
+        {key: record.get(key) for key in ("provider", "record_id", "url", "fields", "identifiers")}
+        for record in records]}
 
 
 async def resolve_public(host: str) -> list[str]:
@@ -260,30 +286,32 @@ class _Session:
         self.registry, self.settings, self.audit, self.cancelled = registry, settings, audit, cancelled
         self.remaining = int(_num(settings, "max_source_requests", 18, 0, 40))
         self.limit = int(_num(settings, "source_max_results", 3, 1, 5))
-        self.timeout = _num(settings, "request_timeout_seconds", 12, 1, 30)
+        self.timeout = _num(settings, "request_timeout_seconds", 12, *SETTING_LIMITS["request_timeout_seconds"])
         self.retries = int(_num(settings, "retries", 1, 0, 2))
         self.partial: list[dict] = []
         self.responses: list[Response] = []
+        self.query: dict[str, str] = {}
 
     async def event(self, provider: str, operation: str, status: str, **extra: Any) -> None:
         event = {"provider": provider, "operation": operation, "status": status,
-                 "duration_ms": 0, "request_summary": "", "error": None,
-                 "cache_hit": False, "cost": None, **extra}
+                 "duration_ms": 0, "request_summary": json.dumps(self.query, ensure_ascii=False), "error": None,
+                 "cache_hit": False, "cost": None, "request_count": 0, **extra}
         await self.audit(event)
 
     async def get(self, provider: str, operation: str, url: str) -> Response:
         # Adapter version and full query semantics are included in cache identity.
-        credential = self.settings.get("credentials", {}).get(provider, "") if provider in {"openalex", "semantic_scholar"} else ""
+        credential = self.settings.get("credentials", {}).get(provider, "") if provider in CREDENTIAL_PROVIDERS else ""
         # A changed identity must not reuse another account's cached outcome.
         scope = hashlib.sha256(credential.encode()).hexdigest() if credential else "anonymous"
         key = ("sources-v1", provider, operation, url, scope)
         cached = self.registry._cache.get(key)
-        if cached and cached[0] > time.monotonic():
+        if cached and cached[0] > time.monotonic() and not self.settings.get("force_refresh"):
             self.registry._cache.move_to_end(key)
             if self.cancelled():
                 raise LookupCancelled("Lookup cancelled")
             await self.event(provider, operation, "success" if cached[1].status != 404 else "empty",
-                             cache_hit=True, request_summary=url, fetched_at=cached[1].fetched_at)
+                             cache_hit=True, request_summary=url, fetched_at=cached[1].fetched_at,
+                             response_summary=_response_summary(cached[1], self.settings))
             self.responses.append(cached[1])
             return cached[1]
         current = url
@@ -295,8 +323,12 @@ class _Session:
                 if self.remaining <= 0:
                     raise BudgetExceeded("Source request budget exhausted")
                 host = validate_url(current)
-                async with self.registry._locks.setdefault(provider, asyncio.Lock()):
-                    delay = self.registry._next_request.get(provider, 0) - time.monotonic()
+                gate = "openreview" if host == "api2.openreview.net" else provider
+                async with self.registry._locks.setdefault(gate, asyncio.Lock()):
+                    delay = self.registry._next_request.get(gate, 0) - time.monotonic()
+                    if gate == "openreview" and delay > self.timeout:
+                        await self.event(provider, operation, "rate_limited", error="OpenReview cooldown active")
+                        raise SourceError("OpenReview cooldown active")
                     await _pause(max(0, delay), self.cancelled)
                     self.remaining -= 1
                     try:
@@ -306,6 +338,8 @@ class _Session:
                         headers = {}
                         # Credentials are scoped to the original provider, never redirect targets.
                         if credential and host == "api.openalex.org" and provider == "openalex":
+                            headers["Authorization"] = f"Bearer {credential}"
+                        if credential and host == "api2.openreview.net" and provider == "openreview":
                             headers["Authorization"] = f"Bearer {credential}"
                         if credential and host == "api.semanticscholar.org" and provider == "semantic_scholar":
                             headers["x-api-key"] = credential
@@ -317,11 +351,22 @@ class _Session:
                         )
                         if len(response.body) > MAX_BYTES:
                             raise SourceError("Response exceeds byte limit")
+                        if provider == "openreview" and credential:
+                            if credential.encode() in response.body:
+                                raise SourceError("OpenReview returned credential-bearing content")
+                            if response.status == 200:
+                                notes = json.loads(response.body)["notes"]
+                                for note in notes:
+                                    if ("everyone" not in note.get("readers", [])
+                                            or any("readers" in field and "everyone" not in field["readers"]
+                                                   for field in note["content"].values())):
+                                        raise SourceError("OpenReview record is not fully public")
                     except (OSError, TimeoutError, SourceError) as exc:
                         name = str(exc) if isinstance(exc, SourceError) else type(exc).__name__
                         await self.event(provider, operation, "cancelled" if isinstance(exc, LookupCancelled)
                                          else "error", request_summary=current, error=name,
-                                         duration_ms=round((time.monotonic() - started) * 1000), attempt=attempt)
+                                         duration_ms=round((time.monotonic() - started) * 1000),
+                                         attempt=attempt + 1, request_count=1)
                         if isinstance(exc, (UnsafeURL, LookupCancelled)):
                             raise
                         if attempt == self.retries:
@@ -329,16 +374,40 @@ class _Session:
                         await _pause(min(2 ** attempt, 4), self.cancelled)
                         continue
                     finally:
-                        self.registry._next_request[provider] = time.monotonic() + MIN_INTERVAL[provider]
+                        self.registry._next_request[gate] = time.monotonic() + MIN_INTERVAL[gate]
+                    if gate == "openreview" and response.status == 429:
+                        value = response.headers.get("retry-after", "")
+                        try:
+                            wait = int(value)
+                        except ValueError:
+                            try:
+                                wait = parsedate_to_datetime(value).timestamp() - time.time()
+                            except (ValueError, TypeError, OverflowError):
+                                wait = 2 ** (attempt + 1)
+                        self.registry._next_request[gate] = time.monotonic() + max(1, wait)
                 status = ("success" if 200 <= response.status < 300 else
-                          "empty" if response.status == 404 else
+                          "empty" if response.status == 404 else "rate_limited" if response.status == 429 else
                           "redirect" if 300 <= response.status < 400 else "error")
+                challenge = (host == "api2.openreview.net" and response.status == 403
+                             and b"ChallengeRequiredError" in response.body)
+                if host == "api2.openreview.net" and status == "redirect":
+                    target = urlsplit(urljoin(current, response.headers.get("location", "")))
+                    challenge = target.hostname == "openreview.net" and target.path == "/challenge"
+                    if challenge:
+                        status = "error"
+                error = f"HTTP {response.status}: OpenReview 要求完成访问验证" if challenge else f"HTTP {response.status}"
                 await self.event(provider, operation, status, request_summary=current,
-                                 duration_ms=round((time.monotonic() - started) * 1000), attempt=attempt,
+                                 duration_ms=round((time.monotonic() - started) * 1000),
+                                 attempt=attempt + 1, request_count=1,
                                  http_status=response.status,
-                                 error=None if status != "error" else f"HTTP {response.status}",
+                                 response_summary=_response_summary(response, self.settings),
+                                 error=error if status in {"error", "rate_limited"} else None,
                                  fetched_at=response.fetched_at)
+                if challenge:
+                    raise SourceError(error)
                 if response.status in (429, 500, 502, 503, 504) and attempt < self.retries:
+                    if gate == "openreview" and response.status == 429:
+                        continue
                     try:
                         retry_after = float(response.headers.get("retry-after", 1))
                     except ValueError:
@@ -355,9 +424,9 @@ class _Session:
                 current = target
                 continue
             if response.status == 404 or 200 <= response.status < 300:
-                ttl = _num(self.settings, "source_cache_ttl_seconds", 3600, 0, 86400)
+                ttl = _num(self.settings, "source_cache_ttl_seconds", 3600, *SETTING_LIMITS["source_cache_ttl_seconds"])
                 if response.status == 404:
-                    ttl = min(ttl, 60)
+                    ttl = min(ttl, NEGATIVE_TTL_SECONDS)
                 if ttl:
                     self.registry._cache[key] = (time.monotonic() + ttl, response)
                     self.registry._trim_cache()
@@ -425,7 +494,7 @@ def _crossref(item: dict, response: Response) -> dict | None:
     authors = " and ".join(clean(f"{a.get('family', '')}, {a.get('given', '')}").strip(", ")
                            if a.get("family") else clean(a.get("name", ""))
                            for a in item.get("author", []) if isinstance(a, dict))
-    fields = {"title": _first(item.get("title")), "author": authors, "doi": doi,
+    fields = {"title": plain_title(_first(item.get("title"))), "author": authors, "doi": doi,
               "year": _year(item.get("published-print") or item.get("published") or item.get("issued")),
               "first_online_year": _year(item.get("published-online")),
               "pages": item.get("page"), "volume": item.get("volume"), "number": item.get("issue"),
@@ -434,16 +503,22 @@ def _crossref(item: dict, response: Response) -> dict | None:
                             "posted-content": "misc"}.get(kind, "article")}
     fields["booktitle" if kind in {"proceedings-article", "book-chapter"} else "journal"] = _first(
         item.get("container-title"))
+    for key in ("title", "journal", "booktitle", "publisher"):
+        if fields.get(key):
+            fields[key] = html.unescape(fields[key])
+    fields["issn"] = ", ".join(issns(item.get("ISSN", [])))
     if kind == "posted-content":
         fields["publication_type"] = "preprint"
         fields.pop("journal", None)
     relations = []
     for relation, entries in item.get("relation", {}).items():
         # Crossref's directed relation vocabulary, not citations or similarity.
-        direction = {"is-preprint-of": "published_as", "has-preprint": "preprint_of"}.get(relation)
+        direction = {"is-preprint-of": "published_as", "has-preprint": "preprint_of",
+                     "is-version-of": "same_work_version", "has-version": "same_work_version"}.get(relation)
         if direction:
             for entry in entries if isinstance(entries, list) else []:
-                target = normalize_doi(entry.get("id", "")) if isinstance(entry, dict) else ""
+                target = normalize_doi(entry.get("id", "")) if (
+                    isinstance(entry, dict) and entry.get("id-type", "doi") == "doi") else ""
                 if target:
                     relations.append({"relation": direction, "target_identifiers": {"doi": target},
                                       "evidence_url": f"https://api.crossref.org/works/{quote(doi, safe='/')}"})
@@ -454,19 +529,17 @@ def _crossref(item: dict, response: Response) -> dict | None:
 class _HTML(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.meta: dict[str, list[str]] = {}
         self.links: list[tuple[str, str]] = []
         self.blocks: list[str] = []
+        self.citation: dict[str, list[str]] = {}
         self._link: list[str] | None = None
         self._block: list[str] | None = None
         self._block_depth = 0
 
     def handle_starttag(self, tag, attrs):
         values = dict(attrs)
-        if tag == "meta":
-            name = (values.get("name") or values.get("property") or "").lower()
-            if name and values.get("content"):
-                self.meta.setdefault(name, []).append(values["content"])
+        if tag == "meta" and (values.get("name") or "").startswith("citation_") and values.get("content"):
+            self.citation.setdefault(values["name"], []).append(values["content"])
         if tag == "a" and values.get("href"):
             self._link = [values["href"], ""]
         if tag in ("pre", "code"):
@@ -557,20 +630,6 @@ def parse_official_bib(text: str) -> dict[str, str]:
 
 
 class SourceRegistry:
-    sources = PROVIDERS
-    capabilities: ClassVar[dict] = {
-        "crossref": {"lookup": True, "search": True, "sync_index": False},
-        "arxiv": {"lookup": True, "search": True, "sync_index": False},
-        "openalex": {"lookup": True, "search": True, "sync_index": False,
-                     "limitation": "Bounded first-page candidates; optional API key; may pool publication versions"},
-        "semantic_scholar": {"lookup": True, "search": True, "sync_index": False,
-                             "limitation": "Optional API key or shared keyless rate limit; may pool publication versions"},
-        "acl": {"lookup": True, "search": True, "sync_index": False,
-                "limitation": "Discovery via enabled indexes, then official BibTeX; not exhaustive"},
-        "pmlr": {"lookup": True, "search": True, "sync_index": False,
-                 "limitation": "Enabled indexes or one hinted volume, then official page; not exhaustive"},
-    }
-
     def __init__(self, *, transport: Callable[..., Awaitable[Response]] | None = None,
                  resolver: Callable[[str], Awaitable[list[str]]] | None = None):
         self._transport = transport or public_transport
@@ -593,22 +652,57 @@ class SourceRegistry:
             if value[1] is response:
                 del self._cache[key]
 
+    async def journal_records(self, identifiers, settings, *, audit, cancelled):
+        session = _Session(self, settings, audit, cancelled)
+        records = []
+        for identifier in issns(identifiers)[:2]:
+            url = f"https://api.crossref.org/journals/{identifier}"
+            try:
+                data, response = await session.json("crossref", "journal_verification", url)
+                item = data.get("message", {}) if isinstance(data, dict) else {}
+                returned = issns(item.get("ISSN", []))
+                title = html.unescape(clean(item.get("title")))
+                records.append({"provider": "crossref", "source_url": url,
+                                "fetched_at": response.fetched_at, "raw_payload": _snapshot(response),
+                                "queried_issn": identifier, "issns": returned, "title": title,
+                                "valid": identifier in returned and bool(title)})
+            except LookupCancelled:
+                break
+            except BudgetExceeded:
+                await session.event("crossref", "journal_verification", "budget_exhausted",
+                                    error="ISSN journal verification request budget exhausted")
+                break
+            except (SourceError, ValueError, TypeError, AttributeError, KeyError):
+                await session.event("crossref", "journal_verification", "error",
+                                    error="ISSN journal verification unavailable")
+                break
+        return records
+
     async def lookup(self, fields: dict[str, str], mode: str, settings: dict, *, audit: Audit,
                      cancelled: Cancelled) -> list[dict]:
         if mode not in {"online", "mock"}:
             raise ValueError("mode must be online or mock")
         session = _Session(self, settings, audit, cancelled)
+        session.query = {key: clean(fields[key])[:1500]
+                         for key in ("title", "author", "year", "doi", "eprint", "arxiv", "url", "volume")
+                         if isinstance(fields.get(key), str)}
         if mode == "mock":
             return await self._mock(fields, session)
         enabled = settings.get("source_enabled", {})
-        enabled_list = settings.get("enabled_sources")
-        active = {provider for provider in PROVIDERS if enabled.get(provider, True)
-                  and (enabled_list is None or provider in enabled_list)}
+        active = {provider for provider in PROVIDERS if enabled.get(provider, True)}
         records: list[dict] = []
         # Requests contain only bounded identifier/title/first-author query hints.
         hints = {k.lower(): clean(v)[:1500] for k, v in fields.items() if isinstance(v, str)}
+        if hints.get("entrytype") == "patent" or re.fullmatch(r"CN\d{8,}[A-Z]\d?", hints.get("edition", ""), re.IGNORECASE):
+            await session.event("coverage", "discovery", "unsupported",
+                                error="当前来源不覆盖专利身份核验，未将专利送入论文搜索")
+            return []
         for provider in PROVIDERS:
             if provider not in active:
+                continue
+            if provider == "iclr" and not iclr_paper_id(hints.get("url", "")):
+                continue
+            if provider == "openreview" and not openreview_id(hints.get("url", "")):
                 continue
             if cancelled():
                 await session.event(provider, "lookup", "cancelled", error="Lookup cancelled")
@@ -620,11 +714,13 @@ class SourceRegistry:
                 if not found:
                     for key, (expiry, response) in list(self._cache.items()):
                         if response in session.responses:
-                            self._cache[key] = (min(expiry, time.monotonic() + 60), response)
-                await session.event(provider, "result", "success" if found else "empty", record_count=len(found))
+                            self._cache[key] = (min(expiry, time.monotonic() + NEGATIVE_TTL_SECONDS), response)
+                await session.event(provider, "result", "success" if found else "empty", record_count=len(found),
+                                    response_summary=_result_summary(found))
             except BudgetExceeded as exc:
                 records.extend(session.partial)
-                await session.event(provider, "lookup", "budget_exceeded", error=str(exc))
+                await session.event(provider, "lookup", "budget_exhausted", error=str(exc))
+                break
             except LookupCancelled:
                 records.extend(session.partial)
                 await session.event(provider, "lookup", "cancelled", error="Lookup cancelled")
@@ -636,6 +732,29 @@ class SourceRegistry:
                 # A failed provider cannot discard the records obtained elsewhere.
                 message = str(exc) if isinstance(exc, SourceError) else f"Invalid provider record: {type(exc).__name__}"
                 await session.event(provider, "lookup", "error", error=message)
+        # Follow relevant index discoveries back to registry records. Index
+        # metadata and input identifiers alone never establish factual identity.
+        if "crossref" in active and not cancelled():
+            known = {r["identifiers"].get("doi") for r in records if r["provider"] == "crossref"}
+            targets = []
+            for record in records:
+                if relevance(hints, record)["status"] == "rejected":
+                    continue
+                targets.append(record["identifiers"].get("doi"))
+                targets.extend(r.get("target_identifiers", {}).get("doi") for r in record.get("relations", []))
+            for doi in list(dict.fromkeys(d for d in targets if d and d not in known))[:session.limit]:
+                session.partial, session.responses = [], []
+                try:
+                    records.extend(await self._crossref({"doi": doi}, records, session))
+                except LookupCancelled:
+                    break
+                except BudgetExceeded:
+                    await session.event("crossref", "candidate_resolution", "budget_exhausted",
+                                        error="Candidate resolution request budget exhausted")
+                    break
+                except (SourceError, ValueError, TypeError, KeyError, AttributeError, IndexError, UnicodeError):
+                    await session.event("crossref", "candidate_resolution", "error",
+                                        error="Candidate DOI could not be verified")
         return list({(r["provider"], r["record_id"]): r for r in records}.values())
 
     async def _crossref(self, fields: dict, records: list, session: _Session) -> list:
@@ -651,6 +770,8 @@ class SourceRegistry:
                 params["query.author"] = fields["author"].split(" and ")[0][:150]
             urls.append(("search", "https://api.crossref.org/works?" + urlencode(params)))
         for operation, url in urls:
+            if operation == "search" and self._formal_match(fields, results):
+                continue
             data, response = await session.json("crossref", operation, url)
             if data is None:
                 continue
@@ -667,6 +788,8 @@ class SourceRegistry:
         identifier = normalize_arxiv(fields.get("eprint", "") or fields.get("arxiv", ""))
         if not identifier:
             identifier = normalize_arxiv(fields.get("url", ""))
+        if not identifier and self._formal_match(fields, records):
+            return []
         params: dict[str, Any] = {"max_results": session.limit}
         if identifier:
             params["id_list"] = identifier
@@ -674,8 +797,13 @@ class SourceRegistry:
             title = re.sub(r'["{}\\]', " ", fields["title"][:400])
             params["search_query"] = f'ti:"{title}"'
             if fields.get("author"):
-                author = fields["author"].split(" and ")[0].split(",")[0].split()[-1]
-                params["search_query"] += f' AND au:"{re.sub(r"[^\w-]", "", author)}"'
+                first = next(iter(names(fields["author"])), "")
+                words = re.findall(r"[\w-]+", first)
+                # Name order is not known for an unpunctuated romanized name.
+                # Search both boundary tokens; later full-roster matching decides.
+                hints = list(dict.fromkeys([words[0], words[-1]])) if words else []
+                if hints:
+                    params["search_query"] += ' AND (' + ' OR '.join(f'au:"{w}"' for w in hints) + ')'
         else:
             return []
         response = await session.get("arxiv", "lookup" if identifier else "search",
@@ -714,7 +842,7 @@ class SourceRegistry:
         urls = []
         if doi:
             urls.append(("lookup", f"https://api.openalex.org/works/https://doi.org/{quote(doi, safe='/')}"))
-        if fields.get("title"):
+        if fields.get("title") and not self._formal_match(fields, records):
             params["search"] = fields["title"][:500]
             urls.append(("search", "https://api.openalex.org/works?" + urlencode(params)))
         results = session.partial
@@ -747,7 +875,7 @@ class SourceRegistry:
         if identifier:
             urls.append(("lookup", "https://api.semanticscholar.org/graph/v1/paper/" +
                          quote(identifier, safe="") + "?" + urlencode({"fields": selection})))
-        if fields.get("title"):
+        if fields.get("title") and not self._formal_match(fields, records):
             urls.append(("search", "https://api.semanticscholar.org/graph/v1/paper/search?" + urlencode({
                 "query": fields["title"][:500], "limit": session.limit, "fields": selection})))
         results = session.partial
@@ -773,15 +901,117 @@ class SourceRegistry:
                                        ids, raw))
         return results
 
+    @staticmethod
+    def _formal_match(fields: dict, records: list) -> bool:
+        # A verified preprint must still discover potential formal publications.
+        return any(r.get("status") == "verified" and publication_type(r) in {"journal", "conference"}
+                   and current_match(fields, r)[0] for r in records)
+
     def _official_hints(self, provider: str, fields: dict, records: list) -> list[str]:
         extract = _acl_id if provider == "acl" else _pmlr_id
         values = [fields.get(provider, ""), fields.get("url", ""), fields.get("doi", "")]
         for record in records:
+            if relevance(fields, record)["status"] == "rejected":
+                continue
             values += [record["identifiers"].get(provider, ""), record["identifiers"].get("doi", ""),
                        record["fields"].get("url", "")]
             values += record["raw_payload"].get("upstream_urls", [])
             values += [r.get("target_identifiers", {}).get("doi", "") for r in record.get("relations", [])]
         return list(dict.fromkeys(identifier for v in values if (identifier := extract(v))))
+
+    async def _iclr(self, fields: dict, records: list, session: _Session) -> list:
+        identifier = iclr_paper_id(fields.get("url", ""))
+        if not identifier:
+            return []
+        year, paper = identifier.split("/")
+        url = f"https://proceedings.iclr.cc/paper_files/paper/{year}/hash/{paper}-Abstract-Conference.html"
+        response = await session.get("iclr", "fetch_publication", url)
+        if response.status == 404:
+            return []
+        page = _HTML()
+        page.feed(response.body.decode("utf-8"))
+        meta = page.citation
+        values = {key: items[0] for key, items in meta.items()}
+        venue = "International Conference on Learning Representations"
+        if (iclr_paper_id(values.get("citation_pdf_url", "")) != identifier
+                or values.get("citation_journal_title") != venue
+                or _year(values.get("citation_publication_date")) != year
+                or not values.get("citation_title") or not meta.get("citation_author")):
+            raise SourceError("ICLR proceedings metadata does not confirm the requested conference paper")
+        bib = {"title": values["citation_title"], "author": " and ".join(meta["citation_author"]),
+               "booktitle": venue, "year": year, "entrytype": "inproceedings", "url": url,
+               "volume": values.get("citation_volume")}
+        if values.get("citation_firstpage") and values.get("citation_lastpage"):
+            bib["pages"] = values["citation_firstpage"] + "--" + values["citation_lastpage"]
+        return [_record("iclr", identifier, url, "official", bib, {"iclr": identifier}, _snapshot(response))]
+
+    async def _openreview(self, fields: dict, records: list, session: _Session) -> list:
+        identifier = openreview_id(fields.get("url", ""))
+        if not identifier:
+            return []
+        url = "https://api2.openreview.net/notes?" + urlencode({"id": identifier})
+        data, response = await session.json("openreview", "lookup", url)
+        if data is None or data.get("notes") == []:
+            return []
+        notes = data["notes"]
+        if len(notes) != 1 or notes[0].get("id") != identifier or notes[0].get("forum") != identifier:
+            raise SourceError("OpenReview response does not match requested submission")
+        note = notes[0]
+        content = {key: item.get("value") for key, item in note["content"].items() if isinstance(item, dict)}
+        title, authors = content.get("title"), content.get("authors")
+        if not isinstance(title, str) or not title or not isinstance(authors, list) or not authors:
+            raise SourceError("OpenReview submission lacks title or authors")
+        forum = "https://openreview.net/forum?" + urlencode({"id": identifier})
+        metadata = {"title": title, "author": " and ".join(authors), "url": forum}
+        venue = content.get("venueid") or ""
+        # A public submission date is insufficient. Require the accepted venue
+        # to own the submission invitation as well as a publication timestamp.
+        accepted = (bool(venue and note.get("pdate")) and not note.get("ddate") and
+                    f"{venue}/-/Submission" in note.get("invitations", []))
+        ids = {"openreview": identifier}
+        if accepted:
+            bib = parse_official_bib(content.get("_bibtex") or "")
+            metadata.update({k: v for k, v in bib.items()
+                             if k in {"entrytype", "journal", "booktitle", "year", "doi", "pages"}})
+            if venue == "TMLR":
+                ids["tmlr"] = identifier
+                metadata.update(entrytype="article", journal="Transactions on Machine Learning Research")
+            elif match := re.fullmatch(r"ICLR\.cc/(\d{4})/Conference", venue):
+                metadata.update(entrytype="inproceedings", booktitle="International Conference on Learning Representations",
+                                year=match.group(1))
+            if metadata.get("doi"):
+                ids["doi"] = normalize_doi(metadata["doi"])
+        record = _record("openreview", identifier, forum, "official", metadata, ids, _snapshot(response))
+        record["publication_state"] = "accepted" if accepted else "submission"
+        if not accepted:
+            record.update(status="candidate", identity_basis="candidate")
+        return [record]
+
+    async def _tmlr(self, fields: dict, records: list, session: _Session) -> list:
+        journal = "Transactions on Machine Learning Research"
+        identifier = openreview_id(fields.get("url", ""))
+        ids = [identifier] if identifier else []
+        if not ids and fields.get("journal", "").casefold() in {journal.casefold(), "tmlr"} and fields.get("title"):
+            params = {"content.venueid": "TMLR", "content.title": fields["title"].strip("{}"),
+                      "limit": session.limit}
+            data, _ = await session.json("tmlr", "search", "https://api2.openreview.net/notes?" + urlencode(params))
+            for note in (data or {}).get("notes", [])[:session.limit]:
+                value = note.get("id", "")
+                if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value):
+                    ids.append(value)
+        for value in dict.fromkeys(ids):
+            url = f"https://jmlr.org/tmlr/papers/bib/{value}.bib"
+            response = await session.get("tmlr", "fetch_publication", url)
+            if response.status == 404:
+                continue
+            bib = parse_official_bib(response.body.decode("utf-8"))
+            if (bib.get("journal", "").casefold() != journal.casefold()
+                    or bib.get("entrytype") != "article" or openreview_id(bib.get("url", "")) != value):
+                raise SourceError("TMLR bibliography does not confirm the requested journal article")
+            session.partial.append(_record("tmlr", value, url, "official", bib,
+                                           {"tmlr": value, "doi": normalize_doi(bib.get("doi", ""))},
+                                           _snapshot(response)))
+        return session.partial
 
     async def _acl(self, fields: dict, records: list, session: _Session) -> list:
         ids = self._official_hints("acl", fields, records)[:session.limit]
@@ -858,6 +1088,7 @@ class SourceRegistry:
                  or _acl_id(fields.get("url", "")) == "N19-1423")
         result = copy.deepcopy(MOCK_BERT_RECORDS) if known else []
         await session.event("mock", "fixture", "mock" if result else "empty", record_count=len(result),
+                            response_summary=_result_summary(result),
                             request_summary="Fixed isolated BERT fixtures; unknown inputs are not synthesized")
         return result
 

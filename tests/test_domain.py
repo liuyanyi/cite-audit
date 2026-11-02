@@ -70,13 +70,30 @@ def test_mock_never_enters_online(kb):
     assert kb.store.all('SELECT id FROM articles') == []
 
 
-def test_wrong_doi_does_not_replace_input(kb):
+def test_relation_target_arriving_later_and_arxiv_revisions_keep_separate_fields(kb):
+    first, publication = deepcopy(MOCK_BERT_RECORDS[:2])
+    first["identifiers"]["arxiv"] = first["fields"]["eprint"] = "1810.04805v1"
+    second = deepcopy(first)
+    second.update(record_id="1810.04805v2", relations=[], raw_payload={"revision": 2})
+    second["identifiers"]["arxiv"] = second["fields"]["eprint"] = "1810.04805v2"
+    second["fields"]["year"] = "2020"
+    publication["relations"] = []
+    ids = [kb.ingest([record], "mock")[0]["version_id"] for record in (first, second, publication)]
+    versions = [kb.version(vid) for vid in ids]
+    assert len(set(ids)) == 3 and len({v["article_id"] for v in versions}) == 1
+    assert [v["fields"]["year"] for v in versions] == ["2018", "2020", "2019"]
+
+
+@pytest.mark.parametrize("field,value", [("doi", "10.18653/v1/n19-1423"),
+                                         ("url", "https://doi.org/10.18653/v1/n19-1423")])
+def test_wrong_identifier_does_not_replace_input(kb, field, value):
     sources = kb.ingest([formal()], 'mock')
-    result = assess(kb, {'fields': {'title': 'A completely different paper', 'doi': '10.18653/v1/n19-1423'},
+    result = assess(kb, {'fields': {'title': 'A completely different paper', field: value},
                          'entry_type': 'article', 'citation_key': 'wrong'}, sources, 'demo', [])
     assert result['identity_state'] != 'confirmed'
     assert result['proposals'] == []
-    assert next(a for a in result['field_assessments'] if a['field'] == 'doi')['judgment'] == 'conflict'
+    assert result['identity_state'] == 'wrong_paper' and not result['has_conflict']
+    assert next(a for a in result['field_assessments'] if a['field'] == field)['evidence']
 
 
 def test_similar_title_no_relationship_never_links(kb):
@@ -105,7 +122,13 @@ def test_arxiv_base_input_matches_specific_revision_but_other_revision_does_not(
     record['fields']['eprint']='1810.04805v2'
     sources = kb.ingest([record], 'mock')
     entry={'fields':{'eprint':'1810.04805','title':BERT_TITLE},'entry_type':'article','citation_key':'bert'}
+    result = assess(kb,entry,sources,'demo',[])
+    assert result['identity_state']=='confirmed'
+    assert next(a for a in result['field_assessments'] if a['field']=='eprint')['judgment']=='consistent'
+    entry['fields'].update(version='v2', url='https://arxiv.org/abs/1810.04805v2')
     assert assess(kb,entry,sources,'demo',[])['identity_state']=='confirmed'
+    entry['fields']['version']='v1'
+    assert assess(kb,entry,sources,'demo',[])['identity_state']!='confirmed'
     entry['fields']['eprint']='1810.04805v1'
     assert assess(kb,entry,sources,'demo',[])['identity_state']!='confirmed'
 
@@ -124,3 +147,19 @@ def test_conflicting_official_id_with_shared_doi_is_unresolved(kb):
     sources=kb.ingest([a,b],'mock')
     assert sources[1]['version_id'] is None
     assert len(kb.store.all('SELECT id FROM versions'))==1
+
+
+def test_raw_response_is_kept_in_snapshot_without_copying_into_source_and_report(kb):
+    record = formal()
+    record["raw_payload"] = {"body": "immutable response " * 1000}
+    source = kb.ingest([record], "mock")[0]
+    assert "raw_payload" not in source
+    stored = kb.store.one("SELECT data FROM sources WHERE id=?", (source["id"],))["data"]
+    assert "immutable response" not in stored
+    snapshot = kb.store.one("SELECT content FROM snapshots WHERE id=?", (source["snapshot_id"],))["content"]
+    assert b"immutable response" in snapshot
+    result = assess(kb, {"fields": record["fields"], "entry_type": "inproceedings", "citation_key": "k"},
+                    [source], "demo", [])
+    assert result["identity_state"] == "confirmed"
+    assert result["sources"][0]["snapshot_id"] == source["snapshot_id"]
+    assert "immutable response" not in str(result)

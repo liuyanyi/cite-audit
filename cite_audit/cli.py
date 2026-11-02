@@ -12,7 +12,7 @@ def main():
     parser.add_argument("--data-dir", default=os.getenv("CITE_AUDIT_DATA_DIR", ".cite-audit-data"))
     args = parser.parse_args()
     os.environ["CITE_AUDIT_DATA_DIR"] = args.data_dir
-    uvicorn.run("cite_audit.api:app", host=args.host, port=args.port)
+    uvicorn.run("cite_audit.api:create_app", factory=True, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

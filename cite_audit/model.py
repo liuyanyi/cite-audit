@@ -24,6 +24,8 @@ from urllib.parse import urlsplit
 
 import httpx2 as httpx
 
+from .policy import MODEL_DEFAULTS, MODEL_LIMITS
+
 PROTOCOLS = {"openai-chat", "openai-responses", "ant-messages"}
 DEFAULT_URLS = {
     "openai-chat": "https://api.openai.com/v1",
@@ -299,11 +301,8 @@ def _validated_config(config: dict) -> dict:
     if not isinstance(value.get("api_key"), str) or not value["api_key"].strip():
         raise ModelPolicyError("api_key_required")
     validate_model_url(_endpoint(value))
-    for key, default, low, high in [
-        ("timeout_seconds", 30, 1, 120), ("max_retries", 2, 0, 3),
-        ("max_output_tokens", 1024, 1, 8192),
-    ]:
-        number = value.get(key, default)
+    for key, (low, high) in MODEL_LIMITS.items():
+        number = value.get(key, MODEL_DEFAULTS[key])
         if isinstance(number, bool) or not isinstance(number, (float, int)) or not low <= number <= high:
             raise ModelPolicyError("invalid_model_limits")
         if key != "timeout_seconds" and int(number) != number:

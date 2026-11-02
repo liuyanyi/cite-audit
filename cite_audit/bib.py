@@ -246,14 +246,12 @@ class Diagnostic:
 
 @dataclass(frozen=True)
 class FieldSpan:
-    name: str
     name_start: int
     name_end: int
     equals: int
     value_start: int
     value_end: int
     comma: int | None
-    expression: str
     uses_macro: bool = False
 
 
@@ -616,14 +614,12 @@ class _Parser:
             pos = self.skip(value_end)
             comma = pos if pos < len(text) and text[pos] == "," else None
             span = FieldSpan(
-                field_name,
                 name_start,
                 name.end(),
                 equals,
                 value_start,
                 value_end,
                 comma,
-                text[value_start:value_end],
                 uses_macro,
             )
             if field_name in entry.fields:

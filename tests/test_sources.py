@@ -69,6 +69,19 @@ class Network:
         return Response(status, headers, body, url, "2026-10-30T00:00:00+00:00")
 
 
+@pytest.mark.asyncio
+async def test_iclr_rejects_page_whose_pdf_identifies_a_different_paper():
+    base = "https://proceedings.iclr.cc/paper_files/paper/2025"
+    url = f"{base}/hash/{'a' * 32}-Abstract-Conference.html"
+    metadata = {"title": "Same title", "author": "Author, Alice",
+                "journal_title": "International Conference on Learning Representations",
+                "publication_date": "2025-05-01", "pdf_url": f"{base}/file/{'b' * 32}-Paper-Conference.pdf"}
+    page = "".join(f'<meta name="citation_{key}" content="{value}">' for key, value in metadata.items())
+    records, events, _ = await lookup(Network(lambda _: (200, page)), {"url": url}, ["iclr"])
+    assert not records
+    assert any(event["status"] == "error" and event["provider"] == "iclr" for event in events)
+
+
 async def lookup(network, fields=None, enabled=None, settings=None, registry=None, mode="online", cancelled=None):
     registry = registry or SourceRegistry(transport=network, resolver=public_dns)
     events = []
@@ -76,10 +89,60 @@ async def lookup(network, fields=None, enabled=None, settings=None, registry=Non
     async def audit(event):
         events.append(event)
 
-    options = {"enabled_sources": enabled or ["crossref"], "retries": 0, **(settings or {})}
+    options = {"source_enabled": {p: p in (enabled or ["crossref"]) for p in sources.PROVIDERS},
+               "retries": 0, **(settings or {})}
     records = await registry.lookup(fields or {"title": BERT_TITLE}, mode, options,
                                     audit=audit, cancelled=cancelled or (lambda: False))
     return records, events, registry
+
+
+async def test_force_refresh_bypasses_source_cache():
+    net = Network(lambda url: (200, {"message": {"items": [CROSSREF]}}))
+    _, _, registry = await lookup(net)
+    count = len(net.calls)
+    _, events, _ = await lookup(net, registry=registry, settings={"force_refresh": True})
+    assert len(net.calls) > count
+    assert not any(e["cache_hit"] for e in events)
+
+
+@pytest.mark.parametrize('input_name,returned_issn,expected', [
+    ('CMC-COMPUTERS MATERIALS \\& CONTINUA', '1546-2226', 'normalization'),
+    ('Unrelated Journal', '1546-2226', 'conflict'),
+    ('CMC-COMPUTERS MATERIALS \\& CONTINUA', '1234-5679', 'conflict'),
+])
+async def test_issn_recheck_end_to_end(tmp_path, monkeypatch, input_name, returned_issn, expected):
+    from cite_audit.service import AuditService
+    item = {**CROSSREF, 'type': 'journal-article', 'ISSN': ['1546-2226'],
+            'container-title': ['Computers, Materials &amp; Continua']}
+    net = Network(lambda url: (200, {'message': {
+        'title': 'Computers Materials & Continua', 'ISSN': [returned_issn]
+    }}) if '/journals/' in url else (200, {'message': item}))
+    service = AuditService(tmp_path, registry=SourceRegistry(transport=net, resolver=public_dns))
+    settings = service.settings.get()
+    settings['source_enabled'] = {p: p == 'crossref' for p in sources.PROVIDERS}
+    monkeypatch.setattr(service.settings, 'get', lambda: settings)
+    raw = ('@article{x,title={' + BERT_TITLE + '},author={Devlin, Jacob},doi={10.18653/v1/N19-1423},'
+           'year={2019},journal={' + input_name + '}}').encode()
+    task = service.create_task(raw, 'journal.bib', '', 'online')
+    await service.run_task(task['id'])
+    detail = service.entries(task['id'], True)[0]
+    assert detail['execution_status'] == 'completed'
+    journal = next(a for a in detail['field_assessments'] if a['field'] == 'journal')
+    assert journal['judgment'] == expected
+    assert journal['reference_value'] == 'Computers, Materials & Continua'
+    assert detail['sources'][0]['fields']['issn'] == '1546-2226'
+    assert len(detail['journal_checks']) == 1
+    snapshot = service.store.one('SELECT * FROM snapshots WHERE id=?', (detail['journal_checks'][0]['snapshot_id'],))
+    assert snapshot is not None
+    frozen = service.freeze(task['id'])
+    assert service.freeze(task['id']) == frozen
+    assert any('/journals/1546-2226' in call[0] for call in net.calls)
+
+
+def test_issn_validation_and_no_generic_prefix_removal():
+    from cite_audit.journals import issns, journal_matches
+    assert issns(['15462226', '1546-2226', '1546-2227', 'not-an-id']) == ['1546-2226']
+    assert not journal_matches('FAKE-Computers Materials & Continua', 'Computers Materials & Continua', ['1546-2226'])
 
 
 @pytest.mark.parametrize("url", [
@@ -147,9 +210,51 @@ async def test_wrong_doi_does_not_disable_title_author_search():
 
 async def test_partial_provider_results_survive_following_request_failure():
     net = Network(lambda url: (503, {}) if "?" in url else (200, {"message": CROSSREF}))
-    records, events, _ = await lookup(net, {"doi": "10.18653/v1/N19-1423", "title": BERT_TITLE})
+    records, events, _ = await lookup(net, {"doi": "10.18653/v1/N19-1423", "title": "Intended different paper"})
     assert len(records) == 1
     assert any(e["status"] == "error" for e in events)
+
+
+async def test_confirmed_doi_avoids_redundant_title_search():
+    net = Network(lambda url: (200, {"message": CROSSREF}))
+    records, events, _ = await lookup(net, {"doi": "10.18653/v1/N19-1423", "title": BERT_TITLE},
+                                      ["crossref", "arxiv"], {"max_source_requests": 1})
+    assert len(records) == len(net.calls) == 1
+    assert not any(e["status"] == "budget_exhausted" for e in events)
+
+
+async def test_verified_preprint_still_searches_for_formal_publication():
+    preprint = {**CROSSREF, 'type': 'posted-content'}
+    net = Network(lambda url: (200, {'message': {'items': []} if '?' in url else preprint}))
+    records, _, registry = await lookup(net, {'doi': CROSSREF['DOI'], 'title': BERT_TITLE})
+    assert len(net.calls) == 2
+    assert not registry._formal_match({'doi': CROSSREF['DOI'], 'title': BERT_TITLE}, records)
+
+
+async def test_patents_do_not_search_paper_indexes():
+    net = Network(lambda url: pytest.fail('Patent must not query paper indexes'))
+    records, events, _ = await lookup(net, {'entrytype': 'patent', 'title': 'A cell segmentation device'})
+    assert not records and not net.calls
+    assert any(e['provider'] == 'coverage' and e['status'] == 'unsupported' for e in events)
+
+
+async def test_relevant_index_doi_is_verified_and_noise_is_not_expanded():
+    def handle(url):
+        if 'api.openalex.org' in url:
+            return 200, {'results': [
+                {'id': 'W1', 'title': BERT_TITLE, 'doi': 'https://doi.org/10.18653/v1/N19-1423'},
+                {'id': 'W2', 'title': 'Unrelated microscopy article', 'doi': 'https://doi.org/10.1234/noise'}]}
+        if '?' in url:
+            return 200, {'message': {'items': []}}
+        assert url.endswith('10.18653/v1/n19-1423')
+        return 200, {'message': CROSSREF}
+    net = Network(handle)
+    records, _, registry = await lookup(net, {'title': BERT_TITLE}, ['crossref', 'openalex'])
+    assert any(r['provider'] == 'crossref' and r['status'] == 'verified' for r in records)
+    assert len(net.calls) == 3
+    noise = {'fields': {'title': 'Unrelated microscopy article'}, 'identifiers': {'acl': 'N19-1423'},
+             'raw_payload': {}}
+    assert registry._official_hints('acl', {'title': BERT_TITLE}, [noise]) == []
 
 
 async def test_arxiv_published_doi_is_relation_not_preprint_identity():
@@ -169,6 +274,14 @@ async def test_arxiv_title_and_author_discovery():
     query = parse_qs(urlsplit(net.calls[0][0]).query)["search_query"][0]
     assert 'ti:"' in query and 'au:"Devlin"' in query
     assert records
+
+
+@pytest.mark.parametrize('author', ['Liu Yanyi', 'Yanyi Liu', 'Liu, Yanyi'])
+async def test_arxiv_does_not_assume_romanized_surname_position(author):
+    net = Network(lambda url: (200, ATOM))
+    await lookup(net, {'title': BERT_TITLE, 'author': author}, ['arxiv'])
+    query = parse_qs(urlsplit(net.calls[0][0]).query)['search_query'][0]
+    assert 'au:"Liu"' in query and 'au:"Yanyi"' in query
 
 
 async def test_arxiv_error_feed_and_xml_entities_are_not_negative_facts():
@@ -301,10 +414,11 @@ async def test_cache_reuses_original_fetched_at_and_clear_is_explicit():
 
 async def test_budget_counts_each_wire_request_and_preserves_partial_results():
     net = Network(lambda url: (200, {"message": CROSSREF}))
-    records, events, _ = await lookup(net, {"doi": "10.18653/v1/N19-1423", "title": BERT_TITLE},
+    records, events, _ = await lookup(net, {"doi": "10.18653/v1/N19-1423", "title": "Intended different paper"},
                                       ["crossref", "arxiv"], {"max_source_requests": 1})
     assert len(net.calls) == 1 and len(records) == 1
-    assert any(e["status"] == "budget_exceeded" for e in events)
+    assert any(e["status"] == "budget_exhausted" for e in events)
+    assert sum(e["request_count"] for e in events) == len(net.calls)
 
 
 async def test_disabled_providers_never_called():
@@ -379,7 +493,16 @@ async def test_retry_is_bounded_and_counted(monkeypatch):
     net = Network(lambda url: (429, {}, {"retry-after": "999999"}))
     _, events, _ = await lookup(net, settings={"retries": 1})
     assert len(net.calls) == 2 and max(waits) <= 5
-    assert [e["attempt"] for e in events if "attempt" in e] == [0, 1]
+    assert [e["attempt"] for e in events if "attempt" in e] == [1, 2]
+    assert sum(e["request_count"] for e in events) == len(net.calls)
+
+
+async def test_configured_timeout_and_positive_ttl_are_not_silently_shortened(monkeypatch):
+    monkeypatch.setattr(sources, "time", SimpleNamespace(monotonic=lambda: 1000.0))
+    net = Network(lambda url: (200, {"message": {"items": [CROSSREF]}}))
+    _, _, registry = await lookup(net, settings={"request_timeout_seconds": 60, "source_cache_ttl_seconds": 604800})
+    assert net.calls[0][2] == 60
+    assert all(expiry == 605800.0 for expiry, _ in registry._cache.values())
 
 
 async def test_mock_is_fixed_isolated_and_not_derived_from_input():
@@ -420,15 +543,16 @@ def test_pinned_connection_uses_checked_ip_and_original_tls_hostname(monkeypatch
 
 @pytest.mark.parametrize("provider,host,expected", [
     ("openalex", "api.openalex.org", {"Authorization": "Bearer configured-test-key"}),
+    ("openreview", "api2.openreview.net", {"Authorization": "Bearer configured-test-key"}),
     ("semantic_scholar", "api.semanticscholar.org", {"x-api-key": "configured-test-key"}),
 ])
 async def test_supported_credentials_header_scoped_and_never_logged(provider, host, expected):
     calls = []
     async def transport(url, addresses, timeout, max_bytes, *, headers=None):
         calls.append((url, headers))
-        body = b'{"results":[],"data":[]}'
+        body = b'{"results":[],"data":[],"notes":[]}'
         return Response(200, {}, body, url, "2026-10-30T00:00:00Z")
-    records, events, registry = await lookup(transport, enabled=[provider],
+    records, events, registry = await lookup(transport, fields={"title": BERT_TITLE, "url": "https://openreview.net/forum?id=example"}, enabled=[provider],
         settings={"credentials": {provider: "configured-test-key"}})
     assert calls and calls[0][1] == expected and urlsplit(calls[0][0]).hostname == host
     assert "configured-test-key" not in str(events) + str(records) + str(registry._cache)
@@ -445,6 +569,16 @@ async def test_credential_is_not_forwarded_to_other_allowlisted_host():
     assert calls[0][1] and calls[1][1] is None
 
 
+async def test_authenticated_openreview_restricted_field_is_not_audited_or_cached():
+    async def transport(url, addresses, timeout, max_bytes, *, headers=None):
+        note = {"readers": ["everyone"], "content": {"authors": {"readers": ["chairs"], "value": "private author"}}}
+        return Response(200, {}, json.dumps({"notes": [note]}).encode(), url)
+    records, events, registry = await lookup(transport, {"url": "https://openreview.net/forum?id=example"},
+                                              ["openreview"], {"credentials": {"openreview": "example-token"}})
+    assert not records and not registry._cache
+    assert "private author" not in str(events) and "example-token" not in str(events)
+
+
 async def test_posted_content_remains_preprint_not_journal():
     record = {**CROSSREF, "type": "posted-content"}
     net = Network(lambda url: (200, {"message": {"items": [record]}}))
@@ -453,3 +587,61 @@ async def test_posted_content_remains_preprint_not_journal():
     assert records[0]["fields"]["entrytype"] == "misc"
     assert "journal" not in records[0]["fields"]
     assert json.loads(records[0]["raw_payload"]["response_body"])["message"]["items"][0] == record
+
+@pytest.mark.parametrize("route", ["forum", "title", "wrong_record"])
+async def test_tmlr_confirms_only_the_official_forum_bibliography(route):
+    forum = "FPVCb0WMuN"
+    title = "Process Reward Models That Think"
+    journal = "Transactions on Machine Learning Research"
+    url = f"https://openreview.net/forum?id={forum}"
+    returned_url = url.lower() if route == "wrong_record" else url
+    bib = (f"@article{{paper, title={{{title}}}, author={{Muhammad Khalifa}}, "
+           f"journal={{{journal}}}, year={{2026}}, url={{{returned_url}}}}}")
+    def handler(request):
+        if request.startswith("https://api2.openreview.net/notes?"):
+            return 200, {"notes": [{"id": forum}]}
+        assert request == f"https://jmlr.org/tmlr/papers/bib/{forum}.bib"
+        return 200, bib
+
+    fields = {"title": title, "journal": journal} if route == "title" else {"url": url}
+    records, events, _ = await lookup(Network(handler), fields, ["tmlr"])
+    if route == "wrong_record":
+        assert not records and any(event["status"] == "error" for event in events)
+    else:
+        assert records[0]["identifiers"] == {"tmlr": forum}
+        assert records[0]["fields"]["journal"] == journal
+        assert records[0]["raw_payload"]["response_body"] == bib
+@pytest.mark.parametrize("state", ["accepted", "submission", "withdrawn", "reply"])
+async def test_openreview_forum_requires_accepted_top_level_note(state):
+    paper = "v8L0pN6EOi"
+    venue = "ICLR.cc/2024/Conference"
+    fields = {"title": "{Let's Verify Step by Step}", "author": "Lightman, Hunter and Kosaraju, Vineet",
+              "url": f"https://openreview.net/forum?id={paper}", "year": "2024",
+              "booktitle": "International Conference on Learning Representations"}
+    content = {"title": {"value": "Let's Verify Step by Step"},
+               "authors": {"value": ["Hunter Lightman", "Vineet Kosaraju"]},
+               "venueid": {"value": venue if state == "accepted" else venue + "/" + state}}
+    note = {"id": paper, "forum": "different" if state == "reply" else paper, "content": content,
+            "invitations": [venue + "/-/Submission"], "pdate": None if state == "submission" else 1700000000000}
+    net = Network(lambda url: (200, {"notes": [note]}))
+    records, events, _ = await lookup(net, fields, ["openreview"])
+    assert [call[0] for call in net.calls] == [f"https://api2.openreview.net/notes?id={paper}"]
+    if state == "reply":
+        assert not records and any(e["status"] == "error" for e in events)
+    elif state == "accepted":
+        assert records[0]["status"] == "verified" and sources.current_match(fields, records[0])[0]
+    else:
+        assert records[0]["status"] == "candidate" and "booktitle" not in records[0]["fields"]
+
+
+async def test_openreview_challenge_and_shared_rate_cooldown():
+    fields = {"url": "https://openreview.net/forum?id=v8L0pN6EOi"}
+    challenge = Network(lambda url: (403, {"name": "ChallengeRequiredError"}))
+    _, events, _ = await lookup(challenge, fields, ["openreview"], {"retries": 2})
+    assert len(challenge.calls) == 1
+    assert any("访问验证" in (e.get("error") or "") for e in events)
+    limited = Network(lambda url: (429, {}, {"retry-after": "60"}))
+    _, events, registry = await lookup(limited, fields, ["openreview"], {"retries": 2})
+    assert any(e["status"] == "rate_limited" for e in events)
+    await lookup(limited, {"journal": "TMLR", "title": "Second paper"}, ["tmlr"], registry=registry)
+    assert len(limited.calls) == 1

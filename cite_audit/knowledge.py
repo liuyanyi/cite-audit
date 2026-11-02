@@ -5,35 +5,35 @@ No task input enters this module. Only retrieved source records can become facts
 from __future__ import annotations
 
 import re
-import unicodedata
 from datetime import UTC, datetime
 
+from .matching import author_match, name_match, names, normalize, plain_title, venue_normalize
 from .storage import Store, dump, load, now, uid
 
-RULE_VERSION = "publication-identity-v1"
-STRONG_IDS = ("doi", "arxiv", "acl", "pmlr")
+RULE_VERSION = "publication-identity-v5"
+STRONG_IDS = ("doi", "arxiv", "acl", "pmlr", "tmlr", "openreview", "iclr")
 ALLOWED_RELATIONS = {"preprint_of", "published_as", "same_work_version"}
-
-
-def normalize(value: str | None) -> str:
-    text = unicodedata.normalize("NFKD", str(value or "")).casefold()
-    text = re.sub(r"\\[a-zA-Z]+", "", text)
-    return re.sub(r"[^\w+#]", "", text)
 
 
 def field_normalize(field: str, value: str | None) -> str:
     """Compare semantics without deleting meaningful identifier/range punctuation."""
     text = str(value or "").strip()
+    if field == "title":
+        return normalize(plain_title(text))
     if field in {"doi", "eprint"}:
         return normalize_id("arxiv" if field == "eprint" else field, text)
     if field in {"pages", "volume", "number", "articleno", "year"}:
         return re.sub(r"[-–—]+", "-", re.sub(r"\s+", "", text)).casefold()
     if field == "url":
         return text.rstrip("/")
+    if field in {"journal", "booktitle"}:
+        return venue_normalize(text)
     return normalize(text)
 
 
 def normalize_id(kind: str, value: str) -> str:
+    if kind in {"tmlr", "openreview"}:
+        return str(value).strip()  # OpenReview forum IDs are case-sensitive.
     value = str(value).strip().casefold()
     if kind == "doi":
         value = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi\s*:\s*)", "", value)
@@ -42,6 +42,13 @@ def normalize_id(kind: str, value: str) -> str:
         value = re.sub(r"\.pdf$", "", value)
         # Explicit preprint revisions retain identity; base lookup handled separately.
     return value.rstrip("/")
+
+
+def arxiv_family(ids: dict) -> str | None:
+    doi = normalize_id("doi", ids.get("doi", ""))
+    value = ids.get("arxiv") or (doi.removeprefix("10.48550/arxiv.") if doi.startswith("10.48550/arxiv.") else "")
+    match = re.fullmatch(r"(\d{4}\.\d{4,5}|[a-z.-]+/\d{7})(?:v\d+)?", normalize_id("arxiv", value))
+    return match[1] if match else None
 
 
 def identifiers(record: dict) -> dict:
@@ -61,11 +68,13 @@ def authors(value: str) -> list[str]:
 
 def identity_compatible(left: dict, right: dict) -> bool:
     """Title/author corroboration prevents a wrong DOI binding from spreading."""
-    lt, rt = normalize(left.get("title")), normalize(right.get("title"))
+    lt, rt = (field_normalize("title", f.get("title")) for f in (left, right))
     if lt and rt and lt != rt:
         return False
-    la, ra = authors(left.get("author", "")), authors(right.get("author", ""))
-    return not (la and ra and la[0] != ra[0])
+    la, ra = names(left.get("author", "")), names(right.get("author", ""))
+    if author_match(left.get("author", ""), right.get("author", "")) == "order_variant":
+        return True
+    return not (la and ra and name_match(la[0], ra[0]) == "different")
 
 
 def same_ids(left: dict, right: dict) -> bool:
@@ -82,17 +91,19 @@ def same_ids(left: dict, right: dict) -> bool:
 
 def publication_tuple_matches(left: dict, right: dict) -> bool:
     """A complete publication tuple can corroborate disjoint official IDs."""
-    required = ("title", "author", "year", "pages")
+    required = ("title", "year", "pages")
     if not all(left.get(k) and right.get(k) and field_normalize(k, left[k]) == field_normalize(k, right[k])
                for k in required):
         return False
+    if author_match(left.get("author", ""), right.get("author", "")) != "full":
+        return False
     venue = "booktitle" if left.get("booktitle") else "journal"
-    return bool(left.get(venue) and right.get(venue) and normalize(left[venue]) == normalize(right[venue]))
+    return bool(left.get(venue) and right.get(venue) and venue_normalize(left[venue]) == venue_normalize(right[venue]))
 
 
 def publication_type(record: dict) -> str:
     f = record.get("fields", {})
-    if (identifiers(record).get("arxiv") or f.get("archiveprefix", "").casefold() == "arxiv"
+    if (identifiers(record).get("arxiv") or arxiv_family(identifiers(record)) or f.get("archiveprefix", "").casefold() == "arxiv"
             or f.get("publication_type") == "preprint"):
         return "preprint"
     if f.get("entrytype", "").casefold() in {"inproceedings", "conference"} or f.get("booktitle"):
@@ -106,11 +117,40 @@ class Knowledge:
     def __init__(self, store: Store):
         self.store = store
 
+    def articles(self, q="", mode="", page=1, page_size=25) -> dict:
+        """Filter and page summaries without hydrating versions or source evidence."""
+        conditions, args = [], []
+        if q:
+            conditions.append("""(instr(casefold(a.title), ?) > 0 OR EXISTS (
+                SELECT 1 FROM versions v WHERE v.article_id=a.id AND (
+                    instr(casefold(json_extract(v.fields, '$.author')), ?) > 0 OR EXISTS (
+                        SELECT 1 FROM json_each(v.identifiers) i
+                        WHERE instr(casefold(i.value), ?) > 0))))""")
+            args.extend([q.casefold()] * 3)
+        if mode:
+            conditions.append("(CASE WHEN a.namespace='mock' THEN 'demo' ELSE 'online' END)=?")
+            args.append(mode)
+        where = " AND ".join(conditions) or "1=1"
+        result = self.store.page(
+            f"articles a WHERE {where}", args, order="a.created_at DESC,a.id", page=page, page_size=page_size,
+            columns="""a.*,
+                COALESCE((SELECT json_extract(v.fields, '$.author') FROM versions v
+                          WHERE v.article_id=a.id ORDER BY v.created_at,v.id LIMIT 1), '') AS author,
+                (SELECT COUNT(*) FROM versions v WHERE v.article_id=a.id) AS version_count,
+                (SELECT COUNT(*) FROM versions v JOIN sources s ON s.version_id=v.id
+                 WHERE v.article_id=a.id) AS source_count,
+                COALESCE((SELECT MAX(v.updated_at) FROM versions v WHERE v.article_id=a.id),
+                         a.created_at) AS updated_at""")
+        for item in result["items"]:
+            item["recommendation"] = load(item["recommendation"])
+        return result
+
     def source(self, source_id: str) -> dict | None:
         row = self.store.one("SELECT * FROM sources WHERE id=?", (source_id,))
         if not row:
             return None
         result = load(row["data"])
+        result.pop("raw_payload", None)
         result.update({"id": row["id"], "source_content_id": row["id"], "snapshot_id": row["snapshot_id"],
                        "version_id": row["version_id"], "assignment_status": row["status"],
                        "namespace": row["namespace"]})
@@ -137,6 +177,11 @@ class Knowledge:
         row["integrated_fields"] = load(row.pop("fields"))
         row["field_selections"] = load(row.pop("selections"))
         row["fields"] = row["integrated_fields"]
+        if row["fields"].get("title"):
+            row["fields"]["title"] = plain_title(row["fields"]["title"])
+        title_selection = row["field_selections"].get("title", {})
+        if title_selection.get("value"):
+            title_selection["value"] = plain_title(title_selection["value"])
         row["sources"] = [self.source(x["id"]) for x in self.store.all(
             "SELECT id FROM sources WHERE version_id=? ORDER BY created_at,id", (version_id,))]
         row["source_ids"] = [x["id"] for x in row["sources"]]
@@ -169,7 +214,20 @@ class Knowledge:
             if mock != (namespace == "mock"):
                 continue
             source_ids.append(self._ingest(record, namespace))
-        self._link_relations(source_ids, namespace)
+        # A relation can arrive before its target, including in another task.
+        target_ids = set()
+        for record in records:
+            target_ids.update(identifiers(record).items())
+        relation_ids = set(source_ids)
+        if target_ids:
+            for row in self.store.all(
+                    "SELECT id,json_extract(data,'$.relations') AS links FROM sources "
+                    "WHERE namespace=? AND version_id IS NOT NULL AND json_array_length(data,'$.relations') > 0",
+                    (namespace,)):
+                if any((k, normalize_id(k, v)) in target_ids for rel in load(row["links"])
+                       for k, v in rel.get("target_identifiers", {}).items()):
+                    relation_ids.add(row["id"])
+        self._link_relations(sorted(relation_ids), namespace)
         article_ids = {r["article_id"] for r in self.store.all(
             "SELECT DISTINCT article_id FROM versions WHERE namespace=?", (namespace,))}
         for article_id in article_ids:
@@ -179,9 +237,13 @@ class Knowledge:
     def _ingest(self, record: dict, namespace: str) -> str:
         snapshot_id = self.store.snapshot(record)
         existing = self.store.one(
-            "SELECT id FROM sources WHERE namespace=? AND provider=? AND record_id=? AND snapshot_id=?",
+            "SELECT id,data FROM sources WHERE namespace=? AND provider=? AND record_id=? AND snapshot_id=?",
             (namespace, record["provider"], record["record_id"], snapshot_id))
         if existing:
+            data = load(existing["data"])
+            if record.get("relations") and data.get("relations") != record["relations"]:
+                data["relations"] = record["relations"]
+                self.store.execute("UPDATE sources SET data=? WHERE id=?", (dump(data), existing["id"]))
             self.store.execute("INSERT INTO source_checks VALUES(?,?) ON CONFLICT(source_id) "
                                "DO UPDATE SET checked_at=excluded.checked_at",
                                (existing["id"], record.get("fetched_at", now())))
@@ -195,8 +257,14 @@ class Knowledge:
         incompatible = False
         if trusted:
             matches = []
+            family_articles = set()
+            family = arxiv_family(ids)
             for row in self.store.all("SELECT * FROM versions WHERE namespace=?", (namespace,)):
                 stored_ids = load(row["identifiers"])
+                if (family and arxiv_family(stored_ids) == family and
+                        publication_type(record) == row["version_type"] == "preprint" and
+                        identity_compatible(source_fields, load(row["fields"]))):
+                    family_articles.add(row["article_id"])
                 contradictory = any(ids.get(k) and stored_ids.get(k) and ids[k] != stored_ids[k] for k in STRONG_IDS)
                 shared = any(ids.get(k) and ids.get(k) == stored_ids.get(k) for k in STRONG_IDS)
                 if contradictory and shared:
@@ -215,17 +283,22 @@ class Knowledge:
                 merged_ids = {**load(matches[0]["identifiers"]), **ids}
                 self.store.execute("UPDATE versions SET identifiers=? WHERE id=?", (dump(merged_ids), version_id))
             elif not matches and not incompatible:
-                article_id, version_id = uid("art"), uid("ver")
+                existing_article = next(iter(family_articles)) if len(family_articles) == 1 else None
+                article_id, version_id = existing_article or uid("art"), uid("ver")
                 timestamp = now()
                 with self.store.connect() as db:
-                    db.execute("INSERT INTO articles VALUES(?,?,?,?,?,?)",
-                               (article_id, namespace, source_fields.get("title", "Untitled source record"),
-                                None, dump({"status": "unavailable", "reason": "Not evaluated", "revision": 0}), timestamp))
+                    if not existing_article:
+                        db.execute("INSERT INTO articles VALUES(?,?,?,?,?,?)",
+                                   (article_id, namespace, source_fields.get("title", "Untitled source record"),
+                                    None, dump({"status": "unavailable", "reason": "Not evaluated", "revision": 0}), timestamp))
                     db.execute("INSERT INTO versions VALUES(?,?,?,?,?,?,?,?,?,?)",
                                (version_id, article_id, namespace, publication_type(record), dump(ids), "{}", "{}", 0,
                                 timestamp, timestamp))
         assignment = "confirmed" if version_id else "unresolved"
         data = dict(record)
+        # The immutable snapshot already owns the response body. Keep only
+        # extracted metadata here, including relations needed for integration.
+        data.pop("raw_payload", None)
         data["assignment_reason"] = ("Verified publication identifier and corroborating identity" if version_id
                                      else "Identity evidence insufficient or contradictory; retained as candidate")
         with self.store.connect() as db:
@@ -254,6 +327,8 @@ class Knowledge:
         for field, choices in values.items():
             # Recompute from sources, not previous integrated values. No majority vote.
             groups = {field_normalize(field, choice["value"]) for choice in choices}
+            if field == "author" and all(author_match(choices[0]["value"], c["value"]) == "full" for c in choices):
+                groups = {"equivalent full names"}
             status = "selected" if len(groups) == 1 else "conflicting"
             selected = choices[0] if status == "selected" else None
             if selected:

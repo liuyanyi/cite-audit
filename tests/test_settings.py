@@ -11,14 +11,14 @@ def settings(tmp_path):
 
 def test_keys_write_only_omitted_preserved_and_empty_clears(settings):
     settings.update({"credentials": {"openalex": "source-secret"}, "model": {"api_key": "model-secret"}})
-    result = settings.get(public=True)
+    result = settings.public()
     assert "source-secret" not in str(result) and "model-secret" not in str(result)
-    assert result["model"]["api_key_configured"] is True
+    assert result["model"]["has_api_key"] is True
     settings.update({"model": {"model": "test"}})
     assert settings.get()["model"]["api_key"] == "model-secret"
     settings.update({"model": {"api_key": ""}})
-    assert settings.get(public=True)["model"]["api_key_configured"] is False
-    assert not any(p["requires_key"] for p in result["providers"])
+    assert settings.public()["model"]["has_api_key"] is False
+    assert not any(p["requires_key"] for p in result["sources"])
 
 
 @pytest.mark.parametrize("update", [
@@ -40,3 +40,27 @@ def test_redaction_is_recursive(settings):
     result = redact({"api_key": "private-value", "message": "Bearer private-value api_key=source-value",
                      "nested": ["private-value"]}, secrets_from(config))
     assert "private-value" not in str(result) and "source-value" not in str(result)
+
+
+def test_public_limits_roundtrip_and_parser_upload_boundary(settings):
+    from cite_audit.bib import MAX_BYTES
+
+    public = settings.public()
+    assert public["limits"]["runtime"]["max_upload_bytes"]["max"] == MAX_BYTES
+    assert public["cache"]["negative_ttl_seconds"] == 60
+    writable = {key: value for key, value in public.items() if key != "limits"}
+    writable["runtime"]["max_upload_bytes"] = MAX_BYTES
+    saved = settings.update_public(writable)
+    assert saved["runtime"]["max_upload_bytes"] == MAX_BYTES
+    assert "api_key" not in saved["model"]
+    with pytest.raises(ValueError):
+        settings.update_public({"runtime": {"max_upload_bytes": MAX_BYTES + 1}})
+    assert settings.public()["runtime"]["max_upload_bytes"] == MAX_BYTES
+
+
+@pytest.mark.parametrize("body", [{"runtime": []}, {"cache": []}, {"model": []}, {"sources": [None]}])
+def test_malformed_public_groups_do_not_write(settings, body):
+    before = settings.get()
+    with pytest.raises(ValueError):
+        settings.update_public(body)
+    assert settings.get() == before

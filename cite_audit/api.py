@@ -1,7 +1,6 @@
 """HTTP boundary for the new local single-user Cite Audit application."""
 from __future__ import annotations
 
-import inspect
 import json
 import os
 from contextlib import asynccontextmanager
@@ -10,13 +9,13 @@ from typing import Annotated
 from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import __version__, presenters
-from .service import AuditService
-from .settings import PROVIDERS
+from .policy import PROVIDERS
+from .service import AuditService, BudgetConfirmationRequired
 from .storage import load
 
 
@@ -37,86 +36,12 @@ class ExportRequest(PreviewRequest):
     expected_output_sha256: str
 
 
-def paginate(items, page=1, page_size=25):
-    page, page_size = max(1, page), min(100, max(1, page_size))
-    return {"items": items[(page - 1) * page_size:page * page_size], "total": len(items),
-            "page": page, "page_size": page_size}
-
-
 def download(content: bytes, filename: str, content_type="application/x-bibtex"):
     # RFC 5987 handles Unicode filenames; CR/LF/path components never enter headers.
     safe = Path(filename.replace("\\", "/")).name.replace("\r", "").replace("\n", "")
     return Response(content, media_type=content_type,
                     headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(safe)}",
                              "X-Content-Type-Options": "nosniff"})
-
-
-def public_settings(service):
-    raw = service.settings.get(public=True)
-    model = dict(raw["model"])
-    model["has_api_key"] = model.pop("api_key_configured", False)
-    model.setdefault("library", "mmsp")
-    model.setdefault("price_source", "mmsp_registry")
-    try:
-        from .model import price_snapshot
-        model["price"] = price_snapshot(service.settings.get()["model"])
-    except (ImportError, ValueError, KeyError):
-        model["price"] = None
-    return {
-        "sources": [{"id": p["id"], "name": p["name"], "enabled": p["enabled"], "implemented": True,
-                     "requires_key": False, "supports_api_key": p["id"] in {"openalex", "semantic_scholar"}, "has_api_key": p["credential_configured"],
-                     "status": "not_tested", "capabilities": ["lookup", "search"]}
-                    for p in raw["providers"]],
-        "model": model,
-        "runtime": {"request_budget": raw["max_task_requests"], "timeout_seconds": raw["request_timeout_seconds"],
-                    "max_retries": raw["retries"], "concurrency": 1, "max_upload_bytes": raw["max_upload_bytes"]},
-        "cache": {"positive_ttl_seconds": raw["source_cache_ttl_seconds"], "negative_ttl_seconds": 60,
-                  "discovery_ttl_seconds": raw["knowledge_ttl_seconds"]},
-        "audit": {"enabled": True, "retain_prompt_text": False, "redact_secrets": True},
-    }
-
-
-def update_settings(service, body):
-    allowed = {"sources", "model", "runtime", "cache", "audit"}
-    if set(body) - allowed:
-        raise ValueError("Unknown settings group")
-    mapped = {}
-    if "sources" in body:
-        if not isinstance(body["sources"], list):
-            raise ValueError("sources must be a list")
-        mapped["source_enabled"], mapped["credentials"] = {}, {}
-        for item in body["sources"]:
-            if item.get("id") not in PROVIDERS:
-                raise ValueError("Unknown source provider")
-            if "enabled" in item:
-                mapped["source_enabled"][item["id"]] = item["enabled"]
-            if "api_key" in item:
-                if item["id"] not in {"openalex", "semantic_scholar"}:
-                    raise ValueError("This source does not support configured credentials")
-                if not isinstance(item["api_key"], str):
-                    raise ValueError("API keys must be strings")
-                mapped["credentials"][item["id"]] = item["api_key"]
-    if "model" in body:
-        writable = {"enabled", "protocol", "model", "base_url", "api_key", "timeout_seconds", "max_retries", "max_output_tokens"}
-        mapped["model"] = {k: v for k, v in body["model"].items() if k in writable}
-        if mapped["model"].get("protocol", "openai-chat") not in {"openai-chat", "openai-responses", "ant-messages"}:
-            raise ValueError("Unsupported model protocol")
-        if "api_key" in mapped["model"] and not isinstance(mapped["model"]["api_key"], str):
-            raise ValueError("Model API key must be a string")
-    for group, translations in {
-        "runtime": {"request_budget": "max_task_requests", "timeout_seconds": "request_timeout_seconds",
-                    "max_retries": "retries", "max_upload_bytes": "max_upload_bytes"},
-        "cache": {"positive_ttl_seconds": "source_cache_ttl_seconds", "discovery_ttl_seconds": "knowledge_ttl_seconds"},
-    }.items():
-        for key, value in body.get(group, {}).items():
-            if key in translations:
-                mapped[translations[key]] = value
-            elif (group, key, value) not in {("runtime", "concurrency", 1), ("cache", "negative_ttl_seconds", 60)}:
-                raise ValueError(f"Unsupported configurable setting: {group}.{key}")
-    if "audit" in body and body["audit"] != {"enabled": True, "retain_prompt_text": False, "redact_secrets": True}:
-        raise ValueError("Audit logging and secret redaction cannot be disabled")
-    service.settings.update(mapped)
-    return public_settings(service)
 
 
 def create_app(data_dir: str | Path | None = None, start_worker: bool = True, registry=None) -> FastAPI:
@@ -157,12 +82,18 @@ def create_app(data_dir: str | Path | None = None, start_worker: bool = True, re
     async def invalid(_request, exc):
         return JSONResponse({"error": {"code": "invalid_request", "message": str(exc), "details": {}}}, 400)
 
+    @app.exception_handler(BudgetConfirmationRequired)
+    async def budget_confirmation(_request, exc):
+        return JSONResponse({"error": {"code": "budget_confirmation_required", "message": str(exc),
+                                       "details": exc.details}}, 409)
+
     @app.get("/api/health")
     def health():
         return {"status": "ok", "version": __version__, "single_user_local_only": True}
 
     @app.post("/api/tasks", status_code=201)
-    async def upload(file: Annotated[UploadFile, File()], name: str = Form(""), mode: str = Form("demo"), config: str = Form("{}")):
+    async def upload(file: Annotated[UploadFile, File()], name: str = Form(""), mode: str = Form("demo"),
+                     config: str = Form("{}"), confirm_budget: bool = Form(False)):
         limit = service.settings.get()["max_upload_bytes"]
         raw = await file.read(limit + 1)
         if len(raw) > limit:
@@ -174,15 +105,25 @@ def create_app(data_dir: str | Path | None = None, start_worker: bool = True, re
         if not isinstance(options, dict):
             raise ValueError("config must be a JSON object")  # noqa: TRY004 - HTTP validation boundary
         filename = Path((file.filename or "references.bib").replace("\\", "/")).name
-        return service.create_task(raw, filename, name, mode, options)
+        return service.create_task(raw, filename, name, mode, options, confirm_budget=confirm_budget)
 
     @app.get("/api/tasks")
     def tasks(q: str = "", execution_status: str = "", sort: str = "created_desc", page: int = 1, page_size: int = 25):
-        items = [service.task(r["id"]) for r in service.store.all("SELECT id FROM tasks")]
-        items = [i for i in items if q.casefold() in (i["name"] + " " + i["filename"]).casefold()
-                 and (not execution_status or i["execution_status"] == execution_status)]
-        items.sort(key=lambda i: i["updated_at"] if sort == "updated_desc" else i["created_at"], reverse=sort != "created_asc")
-        return paginate(items, page, page_size)
+        return service.task_page(q, execution_status, sort, page, page_size)
+
+    @app.get("/api/events")
+    async def events(request: Request, task_id: str = "", after: int | None = None):
+        if task_id:
+            service.raw_task(task_id)
+        raw_cursor = request.headers.get("last-event-id")
+        try:
+            cursor = int(raw_cursor) if raw_cursor is not None else after
+        except ValueError:
+            raise ValueError("Invalid event cursor") from None
+        if cursor is not None and not 0 <= cursor <= 9223372036854775807:
+            raise ValueError("Invalid event cursor")
+        return StreamingResponse(service.events.stream(cursor, task_id or None), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @app.get("/api/tasks/{task_id}")
     def task(task_id: str):
@@ -190,18 +131,18 @@ def create_app(data_dir: str | Path | None = None, start_worker: bool = True, re
 
     @app.get("/api/tasks/{task_id}/entries")
     def entries(task_id: str, q: str = "", identity_state: str = "", recommendation_status: str = "",
-                has_conflict: bool = False, sort: str = "ordinal", page: int = 1, page_size: int = 25):
-        items = service.entries(task_id)
-        items = [i for i in items if q.casefold() in (i["citation_key"] + " " + i["title"] + " " + i["author"]).casefold()
-                 and (not identity_state or i["identity_state"] == identity_state)
-                 and (not recommendation_status or i["recommendation_status"] == recommendation_status)
-                 and (not has_conflict or i["has_conflict"])]
-        items.sort(key=lambda i: i.get(sort, i["ordinal"]) if sort in {"title", "year"} else i["ordinal"])
-        return paginate(items, page, page_size)
+                has_conflict: bool = False, sort: str = "ordinal", page: int = 1, page_size: int = 25,
+                classification: str = ""):
+        return service.entry_page(task_id, q, identity_state, recommendation_status, has_conflict, sort, page, page_size,
+                                  classification)
 
     @app.get("/api/tasks/{task_id}/entries/{entry_id}")
     def entry(task_id: str, entry_id: str):
         return service.entry(task_id, entry_id)
+
+    @app.post("/api/tasks/{task_id}/entries/{entry_id}/retry")
+    def retry_entry(task_id: str, entry_id: str):
+        return service.retry_entry(task_id, entry_id)
 
     @app.get("/api/tasks/{task_id}/original")
     def original(task_id: str):
@@ -211,11 +152,19 @@ def create_app(data_dir: str | Path | None = None, start_worker: bool = True, re
     def report(task_id: str):
         return service.freeze(task_id)
 
+    @app.get("/api/tasks/{task_id}/reports")
+    def report_history(task_id: str):
+        return service.report_history(task_id)
+
+    @app.get("/api/tasks/{task_id}/reports/{revision}")
+    def historical_report(task_id: str, revision: int):
+        return service.historical_report(task_id, revision)
+
     @app.post("/api/tasks/{task_id}/cancel")
     def cancel(task_id: str):
         return service.cancel(task_id)
 
-    @app.post("/api/tasks/{task_id}/retry", status_code=201)
+    @app.post("/api/tasks/{task_id}/retry")
     def retry(task_id: str):
         return service.retry(task_id)
 
@@ -248,16 +197,9 @@ def create_app(data_dir: str | Path | None = None, start_worker: bool = True, re
 
     @app.get("/api/articles")
     def articles(q: str = "", mode: str = "", page: int = 1, page_size: int = 25):
-        items = []
-        for row in service.store.all("SELECT id FROM articles ORDER BY created_at DESC"):
-            art = service.knowledge.article(row["id"])
-            searchable = " ".join([art["title"], art["author"], *[str(v["identifiers"]) for v in art["versions"]]])
-            if q.casefold() not in searchable.casefold():
-                continue
-            item = presenters.article(art, detail=False)
-            if not mode or item["mode"] == mode:
-                items.append(item)
-        return paginate(items, page, page_size)
+        result = service.knowledge.articles(q, mode, page, page_size)
+        result["items"] = [presenters.article(item, detail=False) for item in result["items"]]
+        return result
 
     @app.get("/api/articles/{article_id}")
     def article(article_id: str):
@@ -292,11 +234,11 @@ def create_app(data_dir: str | Path | None = None, start_worker: bool = True, re
 
     @app.get("/api/settings")
     def settings():
-        return public_settings(service)
+        return service.settings.public()
 
     @app.put("/api/settings")
     def put_settings(body: dict):
-        return update_settings(service, body)
+        return service.settings.update_public(body)
 
     @app.get("/api/models/catalog")
     def model_catalog():
@@ -322,26 +264,46 @@ def create_app(data_dir: str | Path | None = None, start_worker: bool = True, re
         config["source_enabled"] = {p: p == provider for p in PROVIDERS}
         config["max_source_requests"] = 2
         config["retries"] = 0
+        config["force_refresh"] = True
         calls = []
         async def audit(item):
             calls.append(service.call(None, None, item, "online"))
-        records = await service.registry.lookup({"doi": "10.18653/v1/N19-1423", "eprint": "1810.04805",
-                                                 "title": "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding"},
-                                                "online", config, audit=audit, cancelled=lambda: False)
-        return {"provider": provider, "status": "available" if records else "unavailable", "calls": calls,
+        # Test an official record within this provider's coverage, not whether
+        # every provider can discover the same paper (BERT is not in PMLR).
+        fields = ({"url": "https://proceedings.iclr.cc/paper_files/paper/2025/hash/"
+                          "5503a7c69d48a2f86fc00b3dc09de686-Abstract-Conference.html"} if provider == "iclr" else
+                  {"pmlr": "v139/radford21a"} if provider == "pmlr" else
+                  {"url": "https://openreview.net/forum?id=v8L0pN6EOi"} if provider == "openreview" else
+                  {"url": "https://openreview.net/forum?id=FPVCb0WMuN"} if provider == "tmlr" else
+                  {"doi": "10.18653/v1/N19-1423", "eprint": "1810.04805",
+                   "title": "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding"})
+        records = await service.registry.lookup(fields, "online", config, audit=audit, cancelled=lambda: False)
+        statuses = {call["status"] for call in calls}
+        if records:
+            status, message = "available", "可访问，已取得测试记录。"
+        elif "rate_limited" in statuses:
+            status, message = "rate_limited", "来源限流，请稍后重试。"
+        elif "failed" in statuses:
+            status, message = "unavailable", "连接或响应处理失败，请查看调用记录。"
+        elif (statuses & {"partial", "budget_exhausted", "cancelled"}
+              or not any(call["request_count"] or call["cache_hit"] for call in calls)):
+            status, message = "inconclusive", "测试未完成，无法判断连接状态，请查看调用记录。"
+        else:
+            status, message = "no_result", "可访问，但测试样例未命中；不代表文献不存在。"
+        return {"provider": provider, "status": status, "message": message, "calls": calls,
                 "records_received": len(records), "knowledge_written": False}
 
     @app.get("/api/calls")
     def calls(task_id: str = "", entry_id: str = "", provider: str = "", status: str = "", page: int = 1, page_size: int = 25):
-        items = [c for c in service.calls(task_id, entry_id) if (not provider or c["provider"] == provider)
-                 and (not status or c["status"] == status)]
-        return paginate(list(reversed(items)), page, page_size)
+        return service.call_page(task_id, entry_id, provider, status, page, page_size)
+
+    @app.get("/api/calls/{call_id}")
+    def call_detail(call_id: str):
+        return service.call_detail(call_id)
 
     @app.delete("/api/query-cache")
-    async def clear_cache():
+    def clear_cache():
         count = service.registry.clear_cache()
-        if inspect.isawaitable(count):
-            count = await count
         return {"cleared": True, "count": count, "knowledge_preserved": True, "history_preserved": True}
 
     static = Path(__file__).parent / "static"
@@ -358,6 +320,3 @@ def create_app(data_dir: str | Path | None = None, start_worker: bool = True, re
         return JSONResponse({"message": "Frontend assets not built. Run npm run build in frontend; API documentation: /docs"}, 404)
 
     return app
-
-
-app = create_app()
