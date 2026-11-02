@@ -4,7 +4,11 @@ const isAbort = (error: unknown) => typeof error === 'object' && error !== null 
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) { super(message); this.status = status; }
+  code?: string;
+  details?: Record<string, unknown>;
+  constructor(message: string, status: number, code?: string, details?: Record<string, unknown>) {
+    super(message); this.status = status; this.code = code; this.details = details;
+  }
 }
 export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   let response: Response;
@@ -12,35 +16,54 @@ export async function request<T>(path: string, options: RequestInit = {}): Promi
   catch (error) { if (isAbort(error)) throw error; throw new ApiError('无法连接本地服务，请检查服务是否已启动后重试。', 0); }
   if (!response.ok) {
     let message = `请求失败（${response.status}）`;
-    try { const body = await response.json(); const detail = body.detail ?? body.error ?? body.message; message = typeof detail === 'string' ? detail : detail?.message ?? (Array.isArray(detail) ? detail.map((d: { msg?: string }) => d.msg).join('；') : message); } catch { /* HTTP status remains useful without JSON. */ }
-    throw new ApiError(message, response.status);
+    let code: string | undefined;
+    let details: Record<string, unknown> | undefined;
+    try {
+      const body = await response.json(); const detail = body.detail ?? body.error ?? body.message;
+      message = typeof detail === 'string' ? detail : detail?.message ?? (Array.isArray(detail) ? detail.map((d: { msg?: string }) => d.msg).join('；') : message);
+      code = body.error?.code; details = body.error?.details;
+    } catch { /* HTTP status remains useful without JSON. */ }
+    throw new ApiError(message, response.status, code, details);
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
-export function useResource<T>(path: string | null, poll = false) {
+export function useResource<T>(path: string | null) {
   const [data, setData] = useState<T | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [revision, setRevision] = useState(0);
   const pathRef = useRef(path);
-  const refresh = useCallback(() => setRevision(v => v + 1), []);
+  const reload = useRef<() => void>(() => {});
+  const refresh = useCallback(() => reload.current(), []);
   useEffect(() => {
     if (!path) { setData(null); setLoading(false); return; }
     const changed = pathRef.current !== path; pathRef.current = path;
     if (changed) setData(null);
-    let disposed = false; let controller: AbortController | null = null;
+    let disposed = false; let running = false; let pending = false;
+    const controller = new AbortController();
     const get = async () => {
-      controller?.abort(); controller = new AbortController();
+      if (disposed) return;
+      if (running) { pending = true; return; }
+      running = true; pending = false;
       try { const result = await request<T>(path, { signal: controller.signal }); if (!disposed) { setData(result); setError(null); } }
       catch (e) { if (!disposed && !(isAbort(e))) setError(errorMessage(e)); }
-      finally { if (!disposed) setLoading(false); }
+      finally {
+        running = false;
+        if (!disposed) { setLoading(false); if (pending) void get(); }
+      }
     };
+    reload.current = () => { void get(); };
+    const visible = () => { if (!document.hidden) void get(); };
+    document.addEventListener('visibilitychange', visible);
+    window.addEventListener('online', visible);
     setLoading(true); void get();
-    const timer = poll ? setInterval(() => { if (!document.hidden) void get(); }, 3000) : null;
-    return () => { disposed = true; controller?.abort(); if (timer) clearInterval(timer); };
-  }, [path, revision, poll]);
-  return { data, loading, error, refresh };
+    return () => {
+      disposed = true; reload.current = () => {}; controller.abort();
+      document.removeEventListener('visibilitychange', visible);
+      window.removeEventListener('online', visible);
+    };
+  }, [path]);
+  return { data, loading, error, refresh, setData };
 }
 export const errorMessage = (e: unknown) => e instanceof Error ? e.message : '发生未知错误，请重试。';
 export const json = (value: unknown): RequestInit => ({ method: 'POST', body: JSON.stringify(value) });

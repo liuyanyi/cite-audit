@@ -7,6 +7,7 @@ import { dateTime, executionLabels, ExecutionBadge, ModeBadge, queryString } fro
 import { UploadDialog } from '../components/UploadDialog';
 import { ActionMenu, Button, EmptyState, InlineError, Loading, Modal, PageHeader, Pagination, SearchInput, Select, useToast } from '../components/ui';
 import './tables.css';
+import { isLiveTask, overviewChanged, useTaskEvents } from '../task-events';
 
 export default function TaskList() {
   const navigate = useNavigate();
@@ -14,6 +15,7 @@ export default function TaskList() {
   const [upload, setUpload] = useState(false);
   const [deleting, setDeleting] = useState<Task | null>(null);
   const [busy, setBusy] = useState(false);
+  const [searchKey, setSearchKey] = useState(0);
   const toast = useToast();
   const q = params.get('q') ?? '';
   const status = params.get('status') ?? '';
@@ -32,8 +34,11 @@ export default function TaskList() {
     setParams(next, { replace: true });
   };
   const { data, loading, error, refresh } = useResource<Page<Task>>(
-    `/tasks?${queryString({ q, execution_status: status, sort, page, page_size: size })}`, true,
+    `/tasks?${queryString({ q, execution_status: status, sort, page, page_size: size })}`,
   );
+  useTaskEvents(Boolean(data && (data.active_tasks || data.items.some(isLiveTask))), undefined, changes => {
+    if (overviewChanged(changes)) refresh();
+  });
   useEffect(() => {
     if (!data || loading) return;
     const lastPage = Math.max(1, Math.ceil(data.total / size));
@@ -64,10 +69,10 @@ export default function TaskList() {
     } />
     <div className="data-table-toolbar" role="toolbar" aria-label="任务筛选">
       <div className="data-table-filters">
-        <SearchInput value={q} onChange={value => set({ q: value })} placeholder="搜索任务、文件名…" label="搜索任务" />
+        <SearchInput key={searchKey} value={q} onChange={value => set({ q: value })} debounceMs={300} placeholder="搜索任务、文件名…" label="搜索任务" />
         <Select aria-label="执行状态筛选" value={status} onValueChange={value => set({ status: value })}
           options={[{ value: '', label: '全部状态' }, ...Object.entries(executionLabels).map(([value, label]) => ({ value, label }))]} />
-        {filtered && <Button variant="ghost" className="filter-reset" onClick={() => set({ q: '', status: '' })}>重置<X size={14} /></Button>}
+        {filtered && <Button variant="ghost" className="filter-reset" onClick={() => { setSearchKey(key => key + 1); set({ q: '', status: '' }); }}>重置<X size={14} /></Button>}
       </div>
       <div className="data-table-tools">
         <Select aria-label="任务排序" value={sort} onValueChange={value => set({ sort: value })}

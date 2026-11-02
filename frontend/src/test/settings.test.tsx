@@ -3,15 +3,8 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom';
 import App from '../App';
-import type { Settings } from '../types';
+import { settingsFixture as fixture } from './fixtures';
 
-const fixture: Settings = {
-  sources: [{ id: 'semantic_scholar', name: 'Semantic Scholar', enabled: true, implemented: true, supports_api_key: true, requires_key: false, has_api_key: true, status: 'not_tested', capabilities: ['lookup', 'search'] }],
-  model: { enabled: true, library: 'mmsp', protocol: 'openai-chat', model: 'sample-model', base_url: 'https://api.example.org', has_api_key: true, timeout_seconds: 30, max_retries: 1, max_output_tokens: 1024, price_source: 'mmsp_registry', price: null },
-  runtime: { request_budget: 100, timeout_seconds: 12, max_retries: 1, concurrency: 1, max_upload_bytes: 5000000 },
-  cache: { positive_ttl_seconds: 3600, negative_ttl_seconds: 300, discovery_ttl_seconds: 86400 },
-  audit: { enabled: true, retain_prompt_text: false, redact_secrets: true },
-};
 const reply = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
 let fetchMock: ReturnType<typeof vi.fn>;
 beforeEach(() => {
@@ -99,6 +92,26 @@ describe('settings configuration and confirmations', () => {
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认发起请求' }));
     await waitFor(() => expect(posts()).toHaveLength(1));
     expect(posts()[0][0]).toBe('/api/settings/sources/semantic_scholar/test');
+  });
+  it.each([
+    ['no_result', '可访问·未命中', '可访问，但测试样例未命中；不代表文献不存在。'],
+    ['inconclusive', '测试未完成', '测试未完成，无法判断连接状态，请查看调用记录。'],
+    ['rate_limited', '来源限流', '来源限流，请稍后重试。'],
+    ['unavailable', '测试失败', '连接或响应处理失败，请查看调用记录。'],
+  ])('shows source test outcome %s without conflating it with inaccessibility', async (status, label, message) => {
+    fetchMock.mockImplementation(async (url: string) => url === '/api/settings'
+      ? reply({ ...fixture, sources: [{ ...fixture.sources[0], id: 'pmlr', name: 'PMLR', supports_api_key: false }] })
+      : reply({ status, message }));
+    const user = userEvent.setup();
+    render(<MemoryRouter initialEntries={['/settings/sources']}><App /></MemoryRouter>);
+    const row = await screen.findByRole('row', { name: 'PMLR' });
+    await user.click(within(row).getByRole('button', { name: '测试连接' }));
+    expect(posts()).toHaveLength(0);
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认发起请求' }));
+    expect(await within(row).findByText(label)).toBeVisible();
+    expect(await screen.findByText(message)).toBeVisible();
+    expect(screen.queryByText('不可访问')).not.toBeInTheDocument();
+    expect(posts()[0][0]).toBe('/api/settings/sources/pmlr/test');
   });
   it('marks unsupported configurable values read-only and retains audit protection', async () => {
     const user = await mount();

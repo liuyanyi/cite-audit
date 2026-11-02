@@ -1,12 +1,15 @@
+import { bibliographicText } from '../bibliographic-text';
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { AlertTriangle, ArrowUpRight, CheckCheck, ChevronRight, Download, FileText, Pause, RefreshCw, SearchCheck, X } from 'lucide-react';
+import { AlertTriangle, ArrowUpRight, CheckCheck, ChevronRight, Download, FileText, Pause, RefreshCw, SearchCheck, SearchX, X } from 'lucide-react';
 import { download, errorMessage, json, request, useResource } from '../api';
 import type { CallRecord, EntrySummary, Page, Task } from '../types';
-import { costText, dateTime, ExecutionBadge, FactBadge, firstAuthor, ModeBadge, queryString, RecommendationBadge } from '../format';
-import { ActionMenu, Button, EmptyState, InlineError, Loading, PageHeader, Pagination, SearchInput, Select, Tabs, useToast } from '../components/ui';
+import { classificationLabels, costText, dateTime, ExecutionBadge, firstAuthor, ModeBadge, queryString } from '../format';
+import { ActionMenu, Button, EmptyState, InlineError, Loading, PageHeader, Pagination, SearchInput, SegmentedControl, Select, Tabs, useToast } from '../components/ui';
 import CallTable from '../components/CallTable';
+import EntryStatus from '../components/EntryStatus';
 import ExportDialog from '../components/ExportDialog';
+import { isLiveTask, overviewChanged, useTaskEvents } from '../task-events';
 import './tables.css';
 
 export default function TaskDetail() {
@@ -16,16 +19,17 @@ export default function TaskDetail() {
   const [tab, setTab] = useState('entries');
   const [exporting, setExporting] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [searchKey, setSearchKey] = useState(0);
   const toast = useToast();
   const q = params.get('q') ?? '';
-  const identity = params.get('identity') ?? '';
-  const recommendation = params.get('recommendation') ?? '';
+  const classification = params.get('classification') ?? '';
   const conflict = params.get('conflict') === 'true';
+  const upgrade = params.get('upgrade') === 'true';
   const sort = params.get('sort') ?? 'ordinal';
   const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
   const requestedSize = Number(params.get('size') ?? 10);
   const size = [10, 20, 50].includes(requestedSize) ? requestedSize : 10;
-  const filtered = Boolean(q || identity || recommendation || conflict);
+  const filtered = Boolean(q || classification || conflict || upgrade);
 
   const set = (values: Record<string, string | number>) => {
     const next = new URLSearchParams(params);
@@ -35,10 +39,10 @@ export default function TaskDetail() {
     if (!('page' in values)) next.set('page', '1');
     setParams(next, { replace: true });
   };
-  const clearFilters = () => set({ q: '', identity: '', recommendation: '', conflict: '' });
-  const task = useResource<Task>(`/tasks/${taskId}`, true);
+  const clearFilters = () => { setSearchKey(key => key + 1); set({ q: '', classification: '', conflict: '', upgrade: '' }); };
+  const task = useResource<Task>(`/tasks/${taskId}`);
   const entries = useResource<Page<EntrySummary>>(
-    `/tasks/${taskId}/entries?${queryString({ q, identity_state: identity, recommendation_status: recommendation, has_conflict: conflict || undefined, sort, page, page_size: size })}`, true,
+    tab === 'entries' ? `/tasks/${taskId}/entries?${queryString({ q, classification, has_conflict: conflict || undefined, recommendation_status: upgrade ? 'upgrade_available' : undefined, sort, page, page_size: size })}` : null,
   );
   useEffect(() => {
     if (!entries.data || entries.loading) return;
@@ -48,7 +52,14 @@ export default function TaskDetail() {
     next.set('page', String(lastPage));
     setParams(next, { replace: true });
   }, [entries.data, entries.loading, page, size, params, setParams]);
-  const calls = useResource<Page<CallRecord>>(tab === 'calls' ? `/calls?task_id=${taskId}&page_size=100` : null, tab === 'calls');
+  const calls = useResource<Page<CallRecord>>(tab === 'calls' ? `/calls?task_id=${taskId}&page_size=100` : null);
+  const reports = useResource<{ items: { revision: number; report_url: string }[] }>(tab === 'file' ? `/tasks/${taskId}/reports?revision=${task.data?.report_revision ?? 1}` : null);
+  useTaskEvents(Boolean(task.data && isLiveTask(task.data)), taskId, changes => {
+    if (overviewChanged(changes)) task.refresh();
+    if (!changes || changes.some(change => change.changed.includes('entry'))) entries.refresh();
+    if (!changes || changes.some(change => change.changed.includes('call'))) calls.refresh();
+    if (!changes || changes.some(change => change.changed.includes('task'))) reports.refresh();
+  });
   const save = async (path: string, filename: string) => {
     try { await download(path, filename); }
     catch (e) { toast(errorMessage(e), true); }
@@ -57,10 +68,10 @@ export default function TaskDetail() {
     if (busy) return;
     setBusy(true);
     try {
-      const result = await request<Task>(`/tasks/${taskId}/${action}`, json({}));
-      toast(action === 'cancel' ? '已请求取消，已完成的结果保留。' : '已从原件创建独立新任务，旧结果保留。');
-      if (action === 'retry') navigate(`/tasks/${result.id}`);
-      else { task.refresh(); entries.refresh(); }
+      const updated = await request<Task>(`/tasks/${taskId}/${action}`, json({}));
+      task.setData(updated);
+      toast(action === 'cancel' ? '已请求取消，已完成的结果保留。' : '已在当前任务中重新核查，历史报告已保留。');
+      task.refresh(); entries.refresh(); calls.refresh(); reports.refresh();
     } catch (e) { toast(errorMessage(e), true); }
     finally { setBusy(false); }
   };
@@ -68,7 +79,7 @@ export default function TaskDetail() {
   const t = task.data;
   const s = t.summary;
   const percent = s.total ? Math.round((s.completed / s.total) * 100) : 0;
-  const incomplete = s.failed + s.queued + s.running + s.cancelled;
+  const unprocessed = s.unprocessed ?? s.total - s.completed;
 
   return <div className="admin-table-page">
     <div className="breadcrumb"><Link to="/tasks">核查任务</Link><ChevronRight size={12} /><span>{t.name}</span></div>
@@ -87,9 +98,9 @@ export default function TaskDetail() {
     <div className="task-overview">
       <div className="task-metric"><div className="task-metric-label">总条目<FileText /></div><div className="task-metric-value">{s.total}</div></div>
       <div className="task-metric"><div className="task-metric-label">已处理<CheckCheck /></div><div className="task-metric-value">{s.completed}<small>{percent}%</small></div></div>
-      <div className="task-metric"><div className="task-metric-label">明确字段冲突<AlertTriangle /></div><div className="task-metric-value">{s.conflicts}</div></div>
-      <div className="task-metric"><div className="task-metric-label">身份未决<SearchCheck /></div><div className="task-metric-value">{s.unresolved}</div></div>
-      <div className="task-metric"><div className="task-metric-label">未处理 / 执行失败<Pause /></div><div className="task-metric-value">{incomplete}</div>{s.parse_errors > 0 && <div className="task-metric-note">解析异常 {s.parse_errors} 条</div>}</div>
+      <div className="task-metric"><div className="task-metric-label">未找到匹配<SearchX /></div><div className="task-metric-value">{s.not_found ?? '—'}</div></div>
+      <div className="task-metric"><div className="task-metric-label">有字段冲突的<AlertTriangle /></div><div className="task-metric-value">{s.conflicts}</div></div>
+      <div className="task-metric"><div className="task-metric-label">未处理的<Pause /></div><div className="task-metric-value">{unprocessed}</div>{s.parse_errors > 0 && <div className="task-metric-note">解析异常 {s.parse_errors} 条</div>}</div>
     </div>
     <div className="task-progress">
       <div className="progress-track" aria-label={`已处理 ${percent}%`}><span className={['partial', 'failed'].includes(t.execution_status) ? 'warning' : undefined} style={{ width: `${percent}%` }} /><span className="danger" style={{ width: `${s.total ? s.failed / s.total * 100 : 0}%` }} /></div>
@@ -99,23 +110,21 @@ export default function TaskDetail() {
       <Tabs label="任务内容" tabs={[{ id: 'entries', label: <>条目列表<span className="inline-count">{s.total}</span></> }, { id: 'calls', label: '调用审计' }, { id: 'file', label: '原件信息' }]} value={tab} onChange={setTab} />
       <div className="actions">
         {['queued', 'running'].includes(t.execution_status) && <Button disabled={busy} onClick={() => void act('cancel')}>取消任务</Button>}
-        {['partial', 'failed', 'cancelled'].includes(t.execution_status) && <Button disabled={busy} onClick={() => void act('retry')}><RefreshCw size={14} />从原件创建新任务</Button>}
+        {['completed', 'partial', 'failed', 'cancelled'].includes(t.execution_status) && <Button disabled={busy || isLiveTask(t)} onClick={() => void act('retry')}><RefreshCw size={14} />重新核查当前任务</Button>}
       </div>
     </div>
     {tab === 'entries' && <>
       <div className="data-table-toolbar" role="toolbar" aria-label="条目筛选">
         <div className="data-table-filters">
-          <SearchInput value={q} onChange={value => set({ q: value })} placeholder="搜索标题、作者、key…" label="搜索条目" />
-          <Select aria-label="事实状态筛选" value={identity} onValueChange={value => set({ identity: value })} options={[
-            { value: '', label: '全部身份状态' }, { value: 'confirmed', label: '身份已确认' }, { value: 'ambiguous', label: '身份有歧义' },
-            { value: 'insufficient', label: '证据不足' }, { value: 'not_found', label: '未找到匹配' }, { value: 'source_failed', label: '来源失败' },
-          ]} />
-          <Select aria-label="建议类型筛选" value={recommendation} onValueChange={value => set({ recommendation: value })} options={[
-            { value: '', label: '全部建议' }, { value: 'upgrade_available', label: '建议正式版' }, { value: 'same_version', label: '当前为推荐版本' },
-            { value: 'unavailable', label: '暂无可靠建议' }, { value: 'ambiguous', label: '推荐待确认' },
-          ]} />
-          <Button aria-pressed={conflict} className={conflict ? 'selected-filter' : ''} onClick={() => set({ conflict: conflict ? '' : 'true' })}><AlertTriangle size={14} />字段冲突</Button>
-          {filtered && <Button variant="ghost" className="filter-reset" onClick={clearFilters}>重置<X size={14} /></Button>}
+          <SearchInput key={searchKey} value={q} onChange={value => set({ q: value })} debounceMs={300} placeholder="搜索标题、作者、key…" label="搜索条目" />
+          <div className="task-filter-options">
+            <SegmentedControl label="类型筛选" value={classification}
+              options={[{ value: '', label: '全部' }, ...Object.entries(classificationLabels).map(([value, label]) => ({ value, label }))]}
+              onChange={value => set({ classification: classification === value ? '' : value })} />
+            <Button aria-pressed={conflict} className={conflict ? 'selected-filter' : ''} onClick={() => set({ conflict: conflict ? '' : 'true' })}><AlertTriangle size={14} />字段冲突</Button>
+            <Button aria-pressed={upgrade} className={`upgrade-filter ${upgrade ? 'selected-upgrade-filter' : ''}`} onClick={() => set({ upgrade: upgrade ? '' : 'true' })}><ArrowUpRight size={14} />找到新版本</Button>
+            {filtered && <Button variant="ghost" className="filter-reset" onClick={clearFilters}>重置<X size={14} /></Button>}
+          </div>
         </div>
         <div className="data-table-tools"><Select aria-label="条目排序" value={sort} onValueChange={value => set({ sort: value })} options={[
           { value: 'ordinal', label: '原文顺序' }, { value: 'title', label: '标题' }, { value: 'year', label: '年份' },
@@ -125,14 +134,13 @@ export default function TaskDetail() {
       {entries.loading && !entries.data ? <Loading /> : entries.data?.items.length ? <>
         <div className="table-wrap admin-data-table"><table className="task-citation-table">
           <caption className="sr-only">本次文件引用核查结果</caption>
-          <thead><tr><th>#</th><th>引用</th><th>第一作者</th><th>年份</th><th>当前版本核验</th><th>主要建议</th><th className="menu-cell"><span className="sr-only">操作</span></th></tr></thead>
+          <thead><tr><th>状态</th><th>引用</th><th>第一作者</th><th>年份</th><th className="menu-cell"><span className="sr-only">操作</span></th></tr></thead>
           <tbody>{entries.data.items.map(entry => {
             const href = `/tasks/${t.id}/entries/${entry.id}?${params}`;
             return <tr key={entry.id}>
-              <td className="table-index">{entry.ordinal + 1}</td>
-              <td className="citation-cell"><Link className="citation-title" title={entry.title} to={href}>{entry.title || '未解析出标题'}</Link><div className="citation-key"><code>{entry.citation_key}</code>{entry.diagnostics.length > 0 && <span className="parse-count">{entry.diagnostics.length} 项解析提示</span>}</div></td>
-              <td className="entry-author">{firstAuthor(entry.author)}</td><td className="muted">{entry.year || '—'}</td>
-              <td><FactBadge entry={entry} /></td><td><RecommendationBadge status={entry.recommendation_status} /></td>
+              <EntryStatus entry={entry} />
+              <td className="citation-cell"><Link className="citation-title" title={bibliographicText(entry.title)} to={href}>{bibliographicText(entry.title) || '未解析出标题'}</Link><div className="citation-key"><code className="citation-key-pill">{entry.citation_key}</code>{(entry.journal || entry.booktitle) && <span className="citation-venue" title={bibliographicText(entry.journal || entry.booktitle)}>{bibliographicText(entry.journal || entry.booktitle)}</span>}{entry.diagnostics.length > 0 && <span className="parse-count">{entry.diagnostics.length} 项解析提示</span>}</div></td>
+              <td className="entry-author">{bibliographicText(firstAuthor(entry.author), 'author')}</td><td className="muted">{entry.year || '—'}</td>
               <td className="menu-cell"><ActionMenu label={`操作 ${entry.citation_key}`} items={[
                 { label: '查看引用详情', icon: <ArrowUpRight size={15} />, onSelect: () => navigate(href) },
                 ...(entry.article_id ? [{ label: '在知识库中查看', icon: <SearchCheck size={15} />, onSelect: () => navigate(`/knowledge/${entry.article_id}`) }] : []),
@@ -144,7 +152,7 @@ export default function TaskDetail() {
       </> : <div className="panel table-empty"><EmptyState title="没有匹配的条目" action={filtered ? <Button onClick={clearFilters}>清除筛选</Button> : undefined} /></div>}
     </>}
     {tab === 'calls' && <div className="panel">{calls.error && <InlineError error={calls.error} retry={calls.refresh} />}{calls.loading && !calls.data ? <Loading /> : <CallTable calls={calls.data?.items ?? []} />}</div>}
-    {tab === 'file' && <div className="panel task-original-panel"><div className="panel-body"><h2>上传原件</h2><dl className="metadata-grid"><div><dt>文件名</dt><dd>{t.filename}</dd></div><div><dt>编码</dt><dd>{t.encoding}</dd></div><div><dt>字节数</dt><dd>{t.byte_size}</dd></div><div><dt>SHA-256</dt><dd className="mono">{t.original_sha256}</dd></div></dl></div></div>}
+    {tab === 'file' && <div className="panel task-original-panel"><div className="panel-body"><h2>上传原件</h2><dl className="metadata-grid"><div><dt>文件名</dt><dd>{t.filename}</dd></div><div><dt>编码</dt><dd>{t.encoding}</dd></div><div><dt>字节数</dt><dd>{t.byte_size}</dd></div><div><dt>SHA-256</dt><dd className="mono">{t.original_sha256}</dd></div></dl><h2>核查报告</h2>{reports.error && <InlineError error={reports.error} retry={reports.refresh} />}{reports.loading && !reports.data ? <Loading /> : reports.data?.items.map(report => <div key={report.revision}><Button onClick={() => void save(report.report_url, `${t.name}.report-v${report.revision}.json`)}>下载第 {report.revision} 次核查报告</Button></div>)}</div></div>}
     {exporting && <ExportDialog task={t} onClose={() => setExporting(false)} />}
   </div>;
 }

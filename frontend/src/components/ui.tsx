@@ -12,7 +12,7 @@ import { AlertCircle, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, 
 export function Button({ children, variant = 'secondary', className = '', type = 'button', ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'secondary' | 'ghost' | 'danger' }) {
   return <button type={type} data-slot="button" className={`button ${variant} ${className}`} {...props}>{children}</button>;
 }
-export function Badge({ children, tone = 'neutral' }: { children: ReactNode; tone?: 'neutral' | 'success' | 'warning' | 'danger' | 'info' }) {
+export function Badge({ children, tone = 'neutral' }: { children: ReactNode; tone?: 'neutral' | 'success' | 'warning' | 'danger' | 'info' | 'conflict' }) {
   return <span data-slot="badge" className={`badge ${tone}`}>{children}</span>;
 }
 export function Switch(props: ComponentProps<typeof SwitchPrimitive.Root>) {
@@ -56,8 +56,61 @@ export function Loading({ label = '正在读取…' }: { label?: string }) {
 export function InlineError({ error, retry }: { error: string; retry?: () => void }) {
   return <div className="notice danger" role="alert"><AlertCircle size={17} /><div><strong>未能完成请求</strong><p>{error}</p></div>{retry && <Button onClick={retry}>重试</Button>}</div>;
 }
-export function SearchInput({ value, onChange, placeholder = '搜索…', label = '搜索' }: { value: string; onChange: (value: string) => void; placeholder?: string; label?: string }) {
-  return <label className="search"><Search size={16} /><input aria-label={label} value={value} placeholder={placeholder} onChange={e => onChange(e.target.value)} />{value && <button aria-label="清除搜索" onClick={() => onChange('')} type="button"><X size={14} /></button>}</label>;
+export function SegmentedControl({ label, value, options, onChange }: {
+  label: string; value: string; options: { value: string; label: string }[]; onChange: (value: string) => void;
+}) {
+  return <div role="group" aria-label={label} className="segmented-control">{options.map(option =>
+    <Button key={option.value} aria-pressed={value === option.value} onClick={() => onChange(option.value)}>{option.label}</Button>,
+  )}</div>;
+}
+export function SearchInput({ value, onChange, placeholder = '搜索…', label = '搜索', debounceMs = 0 }: {
+  value: string; onChange: (value: string) => void; placeholder?: string; label?: string; debounceMs?: number;
+}) {
+  const input = useRef<HTMLInputElement>(null);
+  const initialValue = useRef(value);
+  const submitted = useRef(value);
+  const composing = useRef(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const callback = useRef(onChange);
+  callback.current = onChange;
+  const [draft, setDraft] = useState(value);
+  const cancel = () => clearTimeout(timer.current);
+  const commit = (next: string) => {
+    cancel();
+    if (next === submitted.current) return;
+    submitted.current = next;
+    callback.current(next);
+  };
+  const schedule = (next: string) => {
+    cancel();
+    if (composing.current) return;
+    if (debounceMs) timer.current = setTimeout(() => commit(next), debounceMs);
+    else commit(next);
+  };
+  useEffect(() => {
+    // An acknowledgement must not replace newer text. Navigation cancels a pending draft.
+    if (value === submitted.current) return;
+    clearTimeout(timer.current);
+    submitted.current = value;
+    composing.current = false;
+    if (input.current) input.current.value = value;
+    setDraft(value);
+  }, [value]);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  // Leave preedit text under the browser/IME's control instead of restoring a React value.
+  return <label className="search"><Search size={16} /><input ref={input} aria-label={label} defaultValue={initialValue.current} placeholder={placeholder}
+    onChange={event => { setDraft(event.currentTarget.value); schedule(event.currentTarget.value); }}
+    onCompositionStart={() => { composing.current = true; cancel(); }}
+    onCompositionEnd={event => { composing.current = false; setDraft(event.currentTarget.value); schedule(event.currentTarget.value); }}
+    onKeyDown={event => {
+      if (event.key === 'Enter' && !composing.current && !event.nativeEvent.isComposing && event.keyCode !== 229) {
+        event.preventDefault(); commit(event.currentTarget.value);
+      }
+    }} />{draft && <button aria-label="清除搜索" onClick={() => {
+      composing.current = false; setDraft('');
+      if (input.current) { input.current.value = ''; input.current.focus(); }
+      commit('');
+    }} type="button"><X size={14} /></button>}</label>;
 }
 export function PageHeader({ title, description, actions }: { title: ReactNode; description?: ReactNode; actions?: ReactNode }) {
   return <div className="page-heading"><div><h1>{title}</h1>{description && <div className="page-description">{description}</div>}</div>{actions && <div className="actions">{actions}</div>}</div>;
@@ -90,10 +143,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return <ToastContext.Provider value={(text, error) => setToast({ text, error })}>{children}{toast && <div className={`toast ${toast.error ? 'error' : ''}`} role="status">{toast.error ? <AlertCircle size={17} /> : <Check size={17} />}{toast.text}<button aria-label="关闭通知" onClick={() => setToast(null)}><X size={15} /></button></div>}</ToastContext.Provider>;
 }
 export const useToast = () => useContext(ToastContext);
-export function CopyButton({ text, label = '复制', small = false }: { text: string; label?: string; small?: boolean }) {
+export function CopyButton({ text, label = '复制', small = false, iconOnly = false }: { text: string; label?: string; small?: boolean; iconOnly?: boolean }) {
   const toast = useToast();
   const copy = async () => { try { await navigator.clipboard.writeText(text); toast('已复制到剪贴板'); } catch { toast('无法访问剪贴板，请手动选中复制。', true); } };
-  return <Tooltip label={label}><Button className={small ? 'compact' : ''} onClick={copy} aria-label={label}><Copy size={14} />{label}</Button></Tooltip>;
+  return <Tooltip label={label}><Button variant={iconOnly ? 'ghost' : 'secondary'} className={`${small ? 'compact' : ''} ${iconOnly ? 'icon-button' : ''}`} onClick={copy} aria-label={label}><Copy size={14} aria-hidden="true" />{!iconOnly && label}</Button></Tooltip>;
 }
 export function BibCode({ text, label }: { text: string; label: string }) {
   return <div className="code-block"><div className="code-heading"><span>{label}</span><CopyButton text={text} label="复制 BibTeX" small /></div><pre>{text || '暂无可安全生成的建议'}</pre></div>;
