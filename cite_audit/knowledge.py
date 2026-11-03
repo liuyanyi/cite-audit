@@ -6,13 +6,29 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
+from urllib.parse import parse_qs, urlsplit
 
 from .matching import author_match, name_match, names, normalize, plain_title, venue_normalize
 from .storage import Store, dump, load, now, uid
 
-RULE_VERSION = "publication-identity-v5"
-STRONG_IDS = ("doi", "arxiv", "acl", "pmlr", "tmlr", "openreview", "iclr")
+RULE_VERSION = "publication-identity-v10"
+STRONG_IDS = ("doi", "arxiv", "acl", "pmlr", "tmlr", "openreview", "iclr", "neurips", "cnki")
 ALLOWED_RELATIONS = {"preprint_of", "published_as", "same_work_version"}
+
+
+def forum_track(source: dict) -> str:
+    if not source.get("identifiers", {}).get("openreview"):
+        return ""
+    venue_id = source.get("venue_id", "")
+    venue = source.get("fields", {}).get("booktitle", "")
+    if source["provider"] == "openreview":
+        if "/Workshop/" in venue_id or "workshop" in venue.casefold():
+            return "workshop"
+        if venue_id.endswith("/Conference"):
+            return "main"
+    if source["provider"] == "iclr" and venue_normalize(venue) == "iclr":
+        return "main"
+    return ""
 
 
 def field_normalize(field: str, value: str | None) -> str:
@@ -55,7 +71,10 @@ def identifiers(record: dict) -> dict:
     ids = dict(record.get("identifiers", {}))
     for key in ("doi", "eprint"):
         if record.get("fields", {}).get(key):
-            ids.setdefault("arxiv" if key == "eprint" else key, record["fields"][key])
+            value = record["fields"][key]
+            if key == "eprint" and not arxiv_family({"arxiv": value}):
+                continue
+            ids.setdefault("arxiv" if key == "eprint" else key, value)
     return {key: normalize_id(key, value) for key, value in ids.items()
             if key in STRONG_IDS and value}
 
@@ -64,6 +83,15 @@ def authors(value: str) -> list[str]:
     names = re.split(r"\s+and\s+", value or "", flags=re.IGNORECASE)
     return [normalize(name.split(",")[0] if "," in name else name.split()[-1])
             for name in names if name.strip() and normalize(name) not in {"others", "etal"}]
+
+
+def model_repository_match(left: dict, right: dict) -> bool:
+    url = str(left.get("url", "")).rstrip("/")
+    return bool(re.fullmatch(r"https://huggingface\.co/[\w.-]+/[\w.-]+", url)
+                and url == str(right.get("url", "")).rstrip("/")
+                and left.get("doi") and field_normalize("doi", left["doi"]) == field_normalize("doi", right.get("doi"))
+                and left.get("year") and left["year"] == right.get("year")
+                and str(left.get("publisher", "")).casefold() == str(right.get("publisher", "")).casefold() == "hugging face")
 
 
 def identity_compatible(left: dict, right: dict) -> bool:
@@ -99,6 +127,18 @@ def publication_tuple_matches(left: dict, right: dict) -> bool:
         return False
     venue = "booktitle" if left.get("booktitle") else "journal"
     return bool(left.get(venue) and right.get(venue) and venue_normalize(left[venue]) == venue_normalize(right[venue]))
+
+
+def title_with_subtitle(left: dict, right: dict) -> bool:
+    """Called only for matching identifiers within one publication type."""
+    if author_match(left.get("author", ""), right.get("author", "")) != "full":
+        return False
+    for short, long in ((left, right), (right, left)):
+        main, sep, subtitle = plain_title(long.get("title", "")).partition(":")
+        title = field_normalize("title", short.get("title"))
+        if sep and subtitle.strip() and title and title == field_normalize("title", main):
+            return True
+    return False
 
 
 def publication_type(record: dict) -> str:
@@ -144,6 +184,31 @@ class Knowledge:
         for item in result["items"]:
             item["recommendation"] = load(item["recommendation"])
         return result
+
+    def local_arxiv_source(self, identifier: str, discovery_ttl: int) -> dict | None:
+        """Pinned revisions are durable. Latest-version checks expire independently."""
+        pinned = bool(re.search(r"v\d+$", identifier))
+        rows = self.store.all(
+            "SELECT s.id,s.record_id,s.snapshot_id,p.fetched_at FROM sources s "
+            "JOIN snapshots p ON p.id=s.snapshot_id WHERE s.namespace='online' "
+            "AND s.provider='arxiv' AND s.status='confirmed' "
+            "AND (s.record_id=? OR s.record_id GLOB ?) ORDER BY p.fetched_at DESC",
+            (identifier, identifier if pinned else identifier + "v[0-9]*"))
+        for row in rows:
+            if not pinned:
+                age = (datetime.now(UTC) - datetime.fromisoformat(row["fetched_at"])).total_seconds()
+                if age > discovery_ttl:
+                    continue
+                # A request for a pinned revision cannot establish the latest revision.
+                raw = self.store.one("SELECT content FROM snapshots WHERE id=?", (row["snapshot_id"],))
+                url = load(raw["content"]).get("url", "")
+                queried = parse_qs(urlsplit(url).query).get("id_list", [""])[0].split(",")
+                if identifier not in queried:
+                    continue
+            source = self.source(row["id"])
+            if source["source_type"] == "official" and source["status"] == "verified":
+                return source
+        return None
 
     def source(self, source_id: str) -> dict | None:
         row = self.store.one("SELECT * FROM sources WHERE id=?", (source_id,))
@@ -208,16 +273,17 @@ class Knowledge:
 
     def ingest(self, records: list[dict], namespace: str) -> list[dict]:
         source_ids = []
+        target_ids = set()
         for record in records:
             # Online tasks must never ingest fixture records into online knowledge.
             mock = record.get("status") == "mock" or record.get("source_type") == "mock"
             if mock != (namespace == "mock"):
                 continue
             source_ids.append(self._ingest(record, namespace))
-        # A relation can arrive before its target, including in another task.
-        target_ids = set()
-        for record in records:
             target_ids.update(identifiers(record).items())
+        if not source_ids:
+            return []
+        # A relation can arrive before its target, including in another task.
         relation_ids = set(source_ids)
         if target_ids:
             for row in self.store.all(
@@ -227,17 +293,43 @@ class Knowledge:
                 if any((k, normalize_id(k, v)) in target_ids for rel in load(row["links"])
                        for k, v in rel.get("target_identifiers", {}).items()):
                     relation_ids.add(row["id"])
+        # Reconsider all official forums for this title when either track arrives.
+        for sid in source_ids:
+            source = self.source(sid)
+            if source["version_id"] and forum_track(source):
+                rows = self.store.all(
+                    "SELECT id FROM sources WHERE namespace=? AND provider IN ('iclr','openreview') "
+                    "AND version_id IS NOT NULL AND json_extract(data,'$.fields.title')=?",
+                    (namespace, source["fields"]["title"]))
+                relation_ids.update(row["id"] for row in rows)
         self._link_relations(sorted(relation_ids), namespace)
-        article_ids = {r["article_id"] for r in self.store.all(
-            "SELECT DISTINCT article_id FROM versions WHERE namespace=?", (namespace,))}
-        for article_id in article_ids:
-            self._recommend(article_id)
+        # Resolve owners after linking: a same-work relation can move versions
+        # into the surviving article and remove the previous owner.
+        for row in self.store.all(
+                "SELECT DISTINCT v.article_id FROM sources s JOIN versions v ON s.version_id=v.id "
+                "WHERE s.id IN (SELECT value FROM json_each(?)) ORDER BY v.article_id",
+                (dump(sorted(relation_ids)),)):
+            self._recommend(row["article_id"])
         return [self.source(sid) for sid in source_ids]
 
     def _ingest(self, record: dict, namespace: str) -> str:
+        if namespace == "online" and record["provider"] == "cnki":
+            # The search-row token rotates. The official journal export carries its own file key.
+            from .bib import parse_bib
+            raw = record.get("raw_payload", {})
+            endpoint = urlsplit(raw.get("url", ""))
+            if endpoint.netloc == "kns.cnki.net" and endpoint.path == "/dm8/manage/export.html":
+                doc = parse_bib(raw.get("response_body", ""))
+                if len(doc.entries) == 1 and not doc.diagnostics:
+                    entry = doc.entries[0]
+                    if (entry.entry_type == "article" and not entry.diagnostics
+                            and re.fullmatch(r"[A-Za-z]{2,8}[0-9]{7,15}", entry.key.strip())
+                            and all(entry.fields.get(k) for k in ("title", "author", "journal"))):
+                        record = {**record, "identifiers": {**record["identifiers"], "cnki": entry.key.strip()},
+                                  "status": "verified", "identity_basis": "official_id"}
         snapshot_id = self.store.snapshot(record)
         existing = self.store.one(
-            "SELECT id,data FROM sources WHERE namespace=? AND provider=? AND record_id=? AND snapshot_id=?",
+            "SELECT id,data,version_id FROM sources WHERE namespace=? AND provider=? AND record_id=? AND snapshot_id=?",
             (namespace, record["provider"], record["record_id"], snapshot_id))
         if existing:
             data = load(existing["data"])
@@ -247,8 +339,9 @@ class Knowledge:
             self.store.execute("INSERT INTO source_checks VALUES(?,?) ON CONFLICT(source_id) "
                                "DO UPDATE SET checked_at=excluded.checked_at",
                                (existing["id"], record.get("fetched_at", now())))
-            return existing["id"]
-        sid = uid("src")
+            if existing["version_id"] or record.get("status") not in {"verified", "mock"}:
+                return existing["id"]
+        sid = existing["id"] if existing else uid("src")
         ids = identifiers(record)
         source_fields = record.get("fields", {})
         trusted = record.get("status") in {"verified", "mock"} and record.get("identity_basis") in {
@@ -274,7 +367,16 @@ class Knowledge:
                                and publication_type(record) == row["version_type"]
                                and publication_tuple_matches(source_fields, load(row["fields"])))
                 if same_ids(ids, stored_ids) or tuple_match:
-                    if identity_compatible(source_fields, load(row["fields"])):
+                    known = load(row["fields"])
+                    compatible = identity_compatible(source_fields, known) or model_repository_match(source_fields, known)
+                    if known.get("title") is None:
+                        # A conflicted title must not become a wildcard for later records.
+                        version = self.version(row["id"])
+                        if version["field_selections"].get("title", {}).get("status") == "conflicting":
+                            compatible = any(identity_compatible(source_fields, {"title": c["value"], "author": known.get("author")})
+                                             for c in version["field_selections"]["title"]["evidence"])
+                    if compatible or (same_ids(ids, stored_ids) and publication_type(record) == row["version_type"]
+                                      and title_with_subtitle(source_fields, known)):
                         matches.append(row)
                     else:
                         incompatible = True
@@ -302,10 +404,15 @@ class Knowledge:
         data["assignment_reason"] = ("Verified publication identifier and corroborating identity" if version_id
                                      else "Identity evidence insufficient or contradictory; retained as candidate")
         with self.store.connect() as db:
-            db.execute("INSERT INTO sources VALUES(?,?,?,?,?,?,?,?,?)",
-                       (sid, namespace, record["provider"], record["record_id"], snapshot_id, version_id,
-                        assignment, dump(data), now()))
-        self.store.execute("INSERT INTO source_checks VALUES(?,?)", (sid, record.get("fetched_at", now())))
+            if existing:
+                db.execute("UPDATE sources SET version_id=?,status=?,data=? WHERE id=?",
+                           (version_id, assignment, dump(data), sid))
+            else:
+                db.execute("INSERT INTO sources VALUES(?,?,?,?,?,?,?,?,?)",
+                           (sid, namespace, record["provider"], record["record_id"], snapshot_id, version_id,
+                            assignment, dump(data), now()))
+        if not existing:
+            self.store.execute("INSERT INTO source_checks VALUES(?,?)", (sid, record.get("fetched_at", now())))
         if version_id:
             self._merge(version_id)
         return sid
@@ -343,12 +450,28 @@ class Knowledge:
             (dump(fields), dump(selections), now(), version_id))
 
     def _link_relations(self, source_ids: list[str], namespace: str):
-        for source_id in source_ids:
-            source = self.source(source_id)
+        sources = [self.source(sid) for sid in source_ids]
+        forum_sources = {}
+        for source in sources:
+            if source and source["version_id"] and forum_track(source):
+                forum_sources.setdefault(source["fields"]["title"], []).append(source)
+        for source in sources:
             if not source or not source["version_id"]:
                 continue
             current = self.version(source["version_id"])
-            for rel in source.get("relations", []):
+            links = list(source.get("relations", []))
+            if forum_track(source) == "main":
+                targets = set()
+                mains = set()
+                for candidate in forum_sources.get(source["fields"]["title"], []):
+                    if author_match(source["fields"].get("author", ""), candidate["fields"].get("author", "")) != "full":
+                        continue
+                    forum = candidate["identifiers"]["openreview"]
+                    (targets if forum_track(candidate) == "workshop" else mains).add(forum)
+                if len(mains) == len(targets) == 1 and mains.isdisjoint(targets):
+                    links.append({"relation": "same_work_version", "target_identifiers": {"openreview": targets.pop()},
+                                  "evidence_url": source["source_url"]})
+            for rel in links:
                 if rel.get("relation") not in ALLOWED_RELATIONS or not rel.get("evidence_url"):
                     continue
                 target_ids = {k: normalize_id(k, v) for k, v in rel.get("target_identifiers", {}).items()
@@ -373,7 +496,7 @@ class Knowledge:
                                    (current["article_id"], old))
                         db.execute("DELETE FROM articles WHERE id=?", (old,))
                     db.execute("INSERT OR IGNORE INTO relations VALUES(?,?,?,?,?,?)",
-                               (uid("rel"), current["id"], target["id"], rel["relation"], source_id,
+                               (uid("rel"), current["id"], target["id"], rel["relation"], source["id"],
                                 rel["evidence_url"]))
 
     def _recommend(self, article_id: str):
@@ -396,7 +519,10 @@ class Knowledge:
                 continue
             eligible.append(version)
         formal = [v for v in eligible if v["version_type"] in {"conference", "journal"}]
-        pool = formal or eligible
+        main = [v for v in formal if any(forum_track(s) == "main" for s in v["sources"])]
+        workshop_pair = (len(formal) == 2 and len(main) == 1
+                         and any(forum_track(s) == "workshop" for v in formal for s in v["sources"]))
+        pool = main if workshop_pair else formal or eligible
         chosen = pool[0] if len(pool) == 1 else None
         reason = ("Verified formal publication with explicit same-work evidence" if chosen and formal else
                   "Verified current publication; no confirmed preferable publication" if chosen else

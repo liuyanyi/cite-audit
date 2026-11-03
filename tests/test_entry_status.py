@@ -5,7 +5,20 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cite_audit.api import create_app
+from cite_audit.assessment import assess
 from cite_audit.storage import dump
+
+
+@pytest.mark.parametrize("operation,expected", [("result", "not_found"), ("来源调度", "source_failed")])
+def test_partial_coverage_requires_a_completed_search(operation, expected):
+    calls = [{"provider": "registry", "operation": "search", "status": "success", "request_count": 1},
+             {"provider": "registry", "operation": operation, "status": "no_result" if operation == "result" else "success"},
+             {"provider": "index", "status": "rate_limited", "request_count": 1}]
+    result = assess(None, {"fields": {"title": "Unknown"}, "entry_type": "article", "citation_key": "x"},
+                    [], "online", calls)
+    assert result["identity_state"] == expected
+    if operation == "result":
+        assert any("index" in warning for warning in result["warnings"])
 
 
 @pytest.mark.parametrize('call_status,error_code,identity', [
@@ -51,7 +64,8 @@ def test_classifications_and_counts_cover_failures_ambiguity_unsupported_and_pen
         ('confirmed', 'completed', 'confirmed', 'current_version_confirmed', 'version_confirmed'),
         ('conflict', 'completed', 'confirmed', 'current_version_confirmed', 'version_confirmed'),
         ('missing', 'completed', 'not_found', 'unknown', 'not_found'),
-        ('source_failed', 'partial', 'source_failed', 'unknown', 'not_found'),
+        ('source_failed', 'partial', 'source_failed', 'unknown', 'source_failed'),
+        ('budget', 'completed', 'source_failed', 'unknown', 'budget_exhausted'),
         ('ambiguous', 'completed', 'ambiguous', 'candidate', 'unverifiable'),
         ('insufficient', 'completed', 'insufficient', 'unknown', 'unverifiable'),
         ('patent', 'completed', 'insufficient', 'unknown', 'unverifiable'),
@@ -68,6 +82,13 @@ def test_classifications_and_counts_cover_failures_ambiguity_unsupported_and_pen
     with service.store.connect() as db:
         for entry, (key, status, identity, version, _) in zip(entries, cases, strict=True):
             result = {'identity_state': identity, 'version_status': version, 'has_conflict': key == 'conflict'}
+            if key == 'budget':
+                result['calls'] = [{'status': 'budget_exhausted'}]
+            if key == 'conflict':
+                result['field_assessments'] = [
+                    {'field': field, 'semantic_key': meaning, 'judgment': judgment, 'evidence': [{'snapshot_id': 's'}]}
+                    for field, meaning, judgment in [('journaltitle', 'journal', 'conflict'),
+                                                     ('pages', 'pages', 'conflict'), ('author', 'authors', 'unverifiable')]]
             if key == 'coverage':
                 result['calls'] = [{'provider': 'coverage', 'error_code': 'coverage_unavailable'}]
             db.execute('UPDATE entries SET status=?,result=? WHERE id=?', (status, dump(result), entry['id']))
@@ -78,19 +99,21 @@ def test_classifications_and_counts_cover_failures_ambiguity_unsupported_and_pen
         for item in items:
             detail = client.get(f"{path}/{item['id']}").json()
             assert detail['classification'] == item['classification']
+            expected = ['journaltitle'] if item['citation_key'] == 'conflict' else []
+            assert item['required_corrections'] == detail['required_corrections'] == expected
             if item['classification'] is None:
                 assert detail['evidence_revision']['merge_revision'] is None
         summary = client.get(f"/api/tasks/{task['id']}").json()['summary']
-        assert summary['total'] == 12
-        assert summary['completed'] == 8
+        assert summary['total'] == 13
+        assert summary['completed'] == 9
         assert summary['unprocessed'] == 4
         assert summary['version_confirmed'] == 2
-        assert summary['not_found'] == 2
+        assert summary['not_found'] == 1
         assert summary['unverifiable'] == 6
         assert summary['conflicts'] == 1
         for category, keys in {
             'version_confirmed': ['confirmed', 'conflict'],
-            'not_found': ['missing', 'source_failed'],
+            'not_found': ['missing'], 'source_failed': ['source_failed'], 'budget_exhausted': ['budget'],
             'unverifiable': ['ambiguous', 'insufficient', 'patent', 'coverage', 'parse_failed', 'cancelled'],
         }.items():
             found = []
@@ -99,8 +122,16 @@ def test_classifications_and_counts_cover_failures_ambiguity_unsupported_and_pen
                 assert result['total'] == len(keys)
                 found.extend(item['citation_key'] for item in result['items'])
             assert found == keys
+        active = {'execution_status': 'queued,running', 'page_size': 1}
+        assert client.get(path, params=active).json()['total'] == 2
+        assert client.get(path, params={**active, 'page': 2}).json()['items'][0]['citation_key'] == 'queued'
+        assert client.get(path, params={**active, 'classification': 'unverifiable'}).json()['total'] == 0
+        assert client.get(path, params={'execution_status': 'invalid'}).status_code == 400
         conflicts = client.get(path, params={'classification': 'version_confirmed', 'has_conflict': True}).json()
         assert [item['citation_key'] for item in conflicts['items']] == ['conflict']
+        required = client.get(path, params={'needs_correction': True, 'page_size': 1}).json()
+        assert required['total'] == 1 and required['items'][0]['citation_key'] == 'conflict'
+        assert client.get(path, params={'needs_correction': True, 'q': 'missing'}).json()['total'] == 0
         assert client.get(path, params={'classification': 'invalid'}).status_code == 400
 
 

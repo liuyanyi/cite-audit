@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 
 def plain_title(value: str) -> str:
     """Remove known publisher styling while preserving the enclosed title text."""
-    return re.sub(r"</?(?:i|b|em|strong|italic|bold|jats:italic|jats:bold)\s*>",
+    return re.sub(r"</?(?:i|b|em|strong|italic|bold|scp|jats:italic|jats:bold|jats:sc)\s*>",
                   "", html.unescape(value), flags=re.I)
 
 
@@ -29,6 +29,24 @@ def normalize(value: str | None) -> str:
 
 def venue_normalize(value: str | None) -> str:
     text = html.unescape(str(value or "")).replace(r"\&", "&")
+    main = re.sub(r"^proceedings of (?:the )?", "", text.strip().casefold())
+    main = re.sub(r"^(?:the )?(?:\d+(?:st|nd|rd|th)|first|second|third|\d{4}) ", "", main)
+    main = re.sub(r"\s+(?:19|20)\d{2}$", "", main)
+    for name, pattern in {
+        "neurips": r"(?:advances in neural information processing systems(?: \d+)?|neurips|nips)",
+        "icml": r"(?:international conference on machine learning|icml)",
+        "acl": r"(?:annual meeting of the association for computational linguistics|acl)",
+        "emnlp": r"(?:conference on empirical methods in natural language processing|emnlp)",
+        "naacl": r"(?:conference of the north american chapter of the association for computational linguistics|naacl)",
+        "colm": r"(?:conference on language modeling|colm)",
+    }.items():
+        if re.fullmatch(pattern, main):
+            return name
+    if re.fullmatch(r"\s*(?:(?:proceedings of )?(?:the )?(?:(?:first|second|third|fourth|fifth|sixth|seventh|"
+                    r"eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|\d+(?:st|nd|rd|th)) )?"
+                    r"international conference on learning representations(?:\s*\(iclr(?: \d{4})?\))?|iclr)"
+                    r"(?:[\s,]+\d{4})?\s*", text, re.I) and "workshop" not in text.casefold():
+        return "iclr"
     return normalize(re.sub(r"&;?", " and ", text))
 
 
@@ -54,8 +72,15 @@ def _forms(name: str) -> set[tuple[str, str, str]]:
 
 def name_match(left: str, right: str) -> str:
     """Equivalent full names, compatible initials, or contradictory names."""
+    left, right = (name.replace("Ł", "L").replace("ł", "l") for name in (left, right))
+    if left.strip() == right.strip() and re.fullmatch(r"[㐀-鿿]{2,}", left.strip()):
+        return "full"
     if normalize(left) == normalize(right):
-        return "initials" if re.search(r"\b[a-zA-Z]\b", left + " " + right) else "full"
+        for name in (left, right):
+            given = name.split(",", 1)[1] if "," in name else " ".join(name.split()[:-1])
+            if not any(len(word) > 1 for word in re.findall(r"[^\W\d_]+", given)):
+                return "initials"
+        return "full"
     weak = False
     for lf, lg, li in _forms(left):
         for rf, rg, ri in _forms(right):
@@ -116,7 +141,7 @@ def openreview_id(url: str) -> str:
         parsed = urlsplit(url)
     except ValueError:
         return ""
-    if parsed.hostname != "openreview.net" or parsed.path not in {"/forum", "/pdf"}:
+    if parsed.hostname not in {"openreview.net", "www.openreview.net"} or parsed.path not in {"/forum", "/pdf"}:
         return ""
     ids = parse_qs(parsed.query).get("id", [])
     return ids[0] if len(ids) == 1 and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", ids[0]) else ""

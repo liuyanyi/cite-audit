@@ -82,6 +82,41 @@ async def test_iclr_rejects_page_whose_pdf_identifies_a_different_paper():
     assert any(event["status"] == "error" and event["provider"] == "iclr" for event in events)
 
 
+@pytest.mark.asyncio
+async def test_iclr_booktitle_discovers_the_paper_without_an_input_url():
+    title = "Self-Consistency Improves Chain of Thought Reasoning in Language Models"
+    poster = "/virtual/2023/poster/11718"
+    work = {"@type": "CreativeWork", "name": title, "creditText": "ICLR 2023", "author": [{"name": "Xuezhi Wang"}]}
+    pages = {"https://iclr.cc/Downloads/2023": f'<a href="{poster}">{title}</a>',
+             f"https://iclr.cc{poster}": f'<script type="application/ld+json">{json.dumps(work)}</script>'}
+    net = Network(lambda url: (200, pages[url]))
+    fields = {"booktitle": "The Eleventh International Conference on Learning Representations",
+              "year": "2023", "title": "{" + title + "}"}
+    records, _, _ = await lookup(net, fields, ["iclr"])
+    assert len(records) == 1 and records[0]["source_url"] == f"https://iclr.cc{poster}"
+    fields["booktitle"] = "ICLR 2023 Workshop on Reasoning"
+    records, _, _ = await lookup(net, fields, ["iclr"])
+    assert not records and len(net.calls) == 2
+
+
+@pytest.mark.parametrize("venue,provider,first_url", [
+    ("Advances in Neural Information Processing Systems", "neurips", "https://proceedings.neurips.cc/paper/2022"),
+    ("Proceedings of the 39th International Conference on Machine Learning", "pmlr", "https://proceedings.mlr.press/"),
+    ("Proceedings of the 2022 Conference on Empirical Methods in Natural Language Processing", "acl",
+     "https://aclanthology.org/volumes/2022.emnlp-main.bib"),
+    ("First Conference on Language Modeling", "colm", "https://colmweb.org/2022/AcceptedPapers.html"),
+])
+async def test_booktitle_selects_official_directory_before_indexes(venue, provider, first_url):
+    net = Network(lambda _: (404, ""))
+    fields = {"booktitle": venue, "year": "2022", "title": "Sample paper"}
+    await lookup(net, fields, [provider, "crossref"])
+    assert net.calls[0][0] == first_url
+    net.calls.clear()
+    fields["booktitle"] += " Workshop"
+    await lookup(net, fields, [provider])
+    assert not net.calls
+
+
 async def lookup(network, fields=None, enabled=None, settings=None, registry=None, mode="online", cancelled=None):
     registry = registry or SourceRegistry(transport=network, resolver=public_dns)
     events = []
@@ -218,7 +253,7 @@ async def test_partial_provider_results_survive_following_request_failure():
 async def test_confirmed_doi_avoids_redundant_title_search():
     net = Network(lambda url: (200, {"message": CROSSREF}))
     records, events, _ = await lookup(net, {"doi": "10.18653/v1/N19-1423", "title": BERT_TITLE},
-                                      ["crossref", "arxiv"], {"max_source_requests": 1})
+                                      ["crossref"], {"max_source_requests": 1})
     assert len(records) == len(net.calls) == 1
     assert not any(e["status"] == "budget_exhausted" for e in events)
 
@@ -254,7 +289,7 @@ async def test_relevant_index_doi_is_verified_and_noise_is_not_expanded():
     assert len(net.calls) == 3
     noise = {'fields': {'title': 'Unrelated microscopy article'}, 'identifiers': {'acl': 'N19-1423'},
              'raw_payload': {}}
-    assert registry._official_hints('acl', {'title': BERT_TITLE}, [noise]) == []
+    assert not registry._official_hints('acl', {'title': BERT_TITLE}, [noise])
 
 
 async def test_arxiv_published_doi_is_relation_not_preprint_identity():
@@ -269,11 +304,16 @@ async def test_arxiv_published_doi_is_relation_not_preprint_identity():
 
 
 async def test_arxiv_title_and_author_discovery():
-    net = Network(lambda url: (200, ATOM))
-    records, _, _ = await lookup(net, {"title": BERT_TITLE, "author": "Devlin, Jacob and Another, Author"}, ["arxiv"])
-    query = parse_qs(urlsplit(net.calls[0][0]).query)["search_query"][0]
-    assert 'ti:"' in query and 'au:"Devlin"' in query
-    assert records
+    net = Network(lambda url: (200, ATOM if "arxiv.org" in url else {"message": CROSSREF}))
+    records, events, _ = await lookup(net, {"doi": CROSSREF["DOI"], "title": "{" + BERT_TITLE + "}",
+                                       "author": "Devlin, Jacob"}, ["crossref", "arxiv"])
+    plan = next(event for event in events if event["provider"] == "discovery")
+    assert plan["request_count"] == 0
+    assert json.loads(plan["request_summary"])["调度顺序"] == ["crossref", "arxiv"]
+    assert json.loads(plan["request_summary"])["跳过原因"]["openreview"] == "来源已禁用"
+    query = parse_qs(urlsplit(net.calls[-1][0]).query)["search_query"][0]
+    assert f'ti:"{BERT_TITLE}"' in query and 'au:"Devlin"' in query
+    assert {r["provider"] for r in records} == {"crossref", "arxiv"}
 
 
 @pytest.mark.parametrize('author', ['Liu Yanyi', 'Yanyi Liu', 'Liu, Yanyi'])
@@ -645,3 +685,98 @@ async def test_openreview_challenge_and_shared_rate_cooldown():
     assert any(e["status"] == "rate_limited" for e in events)
     await lookup(limited, {"journal": "TMLR", "title": "Second paper"}, ["tmlr"], registry=registry)
     assert len(limited.calls) == 1
+
+async def test_arxiv_shared_backoff_and_single_probe(monkeypatch):
+    replies = iter([(429, {}, {}), (429, {}, {}), (429, {}, {"retry-after": "3600"}),
+                   (404, {}), (429, {}, {})])
+    net = Network(lambda url: next(replies))
+    registry = SourceRegistry(transport=net, resolver=public_dns)
+    now = 1000
+    monkeypatch.setattr(sources, "time", SimpleNamespace(monotonic=lambda: now))
+
+    async def query(title):
+        await lookup(net, {"title": title}, ["arxiv"], registry=registry)
+
+    for count, seconds in enumerate([60, 120, 3600], start=1):
+        await asyncio.gather(query("First"), query("Second"))
+        assert len(net.calls) == count
+        assert registry.arxiv_cooldown()["remaining_seconds"] == seconds
+        now += seconds
+    await query("After cooldown")
+    now += 4
+    await query("New limit")
+    assert registry.arxiv_cooldown()["remaining_seconds"] == 60
+
+
+async def test_arxiv_batch_only_fetches_missing_ids_and_routes_versions():
+    first, second, third = "2101.00001", "2101.00002v1", "2101.00003"
+    def feed(url):
+        ids = parse_qs(urlsplit(url).query)["id_list"][0].split(",")
+        entries = "".join(f"<entry><id>https://arxiv.org/abs/{key}</id><title>{key}</title></entry>"
+                          for key in reversed(ids) if key != second)
+        return 200, f'<feed xmlns="http://www.w3.org/2005/Atom">{entries}</feed>'
+    net = Network(feed)
+    _, _, registry = await lookup(net, {"eprint": first}, ["arxiv"])
+    settings = {"arxiv_batch_ids": [first, second, third], "arxiv_batch_results": {}}
+    registry._next_request.clear()
+    for key, expected in [(third, [third]), (second, []), (first, [first])]:
+        records, _, _ = await lookup(net, {"eprint": key}, ["arxiv"], settings, registry)
+        assert [record["record_id"] for record in records] == expected
+    assert [parse_qs(urlsplit(call[0]).query)["id_list"][0] for call in net.calls] == [first, f"{third},{second}"]
+
+
+async def test_task_reuses_official_acl_snapshot_after_restart(tmp_path):
+    from cite_audit.service import AuditService
+    net = Network(lambda url: (200, ACL_BIB))
+    def service():
+        return AuditService(tmp_path, registry=SourceRegistry(transport=net, resolver=public_dns))
+    app = service()
+    app.settings.update({"source_enabled": {p: p == "acl" for p in sources.PROVIDERS},
+                         "knowledge_ttl_seconds": 0, "source_cache_ttl_seconds": 0})
+    for count in (1, 1):
+        task = app.create_task(ACL_BIB.encode(), "paper.bib", "", "online", {})
+        await app.run_task(task["id"])
+        assert len(net.calls) == count
+        app = service()
+    calls = app.calls(task["id"])
+    assert any(c["provider"] == "acl" and c["cache_hit"] for c in calls)
+    changed = ACL_BIB.replace("N19-1423", "N19-9999")
+    task = app.create_task(changed.encode(), "different.bib", "", "online", {})
+    await app.run_task(task["id"])
+    assert len(net.calls) == 2
+
+
+async def test_crossref_doi_reuse_requires_matching_publication(tmp_path):
+    from cite_audit.service import AuditService
+    net = Network(lambda url: (200, {"message": CROSSREF if "/works/" in url else {"items": []}}))
+    def service():
+        return AuditService(tmp_path, registry=SourceRegistry(transport=net, resolver=public_dns))
+    app = service()
+    app.settings.update({"source_enabled": {p: p == "crossref" for p in sources.PROVIDERS},
+                         "knowledge_ttl_seconds": 0, "source_cache_ttl_seconds": 0})
+    async def run(bib):
+        task = app.create_task(bib.encode(), "doi.bib", "", "online", {})
+        await app.run_task(task["id"])
+        return app.calls(task["id"])
+    await run(ACL_BIB)
+    assert len(net.calls) == 1
+    app = service()
+    calls = await run(ACL_BIB)
+    assert len(net.calls) == 1
+    assert any(c["provider"] == "crossref" and c["cache_hit"] for c in calls)
+    await run(ACL_BIB.replace("Devlin, Jacob", "Smith, Alice").replace("{BERT}", "Oceanography").replace(
+        "Pre-training of Deep Bidirectional Transformers for Language Understanding", "Marine environments"))
+    assert any("query.title" in url for url, *_ in net.calls)
+
+
+async def test_mismatched_forum_searches_title_for_accepted_alternative():
+    def note(forum, year):
+        venue = f"ICLR.cc/{year}/Conference"
+        return {"id": forum, "forum": forum, "pdate": 1, "invitations": [venue + "/-/Submission"],
+                "content": {"venueid": {"value": venue}, "authors": {"value": ["Jane Smith"]},
+                            "title": {"value": "Example Paper"}}}
+    first, second = note("first", 2023), note("second", 2024)
+    net = Network(lambda url: (200, {"notes": [first, second] if "content.title" in url else [first]}))
+    records, _, _ = await lookup(net, {"url": "https://openreview.net/forum?id=first",
+                                       "title": "Example Paper", "year": "2024"}, ["openreview"])
+    assert [r["record_id"] for r in records] == ["first", "second"]

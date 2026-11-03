@@ -38,6 +38,19 @@ def test_same_version_complement_conflict_and_evidence(kb):
     assert kb.article(v['article_id'])['recommended_version_id'] is None
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_same_doi_subtitle_and_year_disagreement_preserve_identity(kb, reverse):
+    full = formal(title="A metric: measuring quality", year="2020")
+    short = formal("registry", title="A metric", year="2019")
+    records = [full, short]
+    sources = kb.ingest(records[::-1] if reverse else records, "mock")
+    result = assess(kb, {"fields": full["fields"], "entry_type": "inproceedings", "citation_key": "metric"},
+                    sources, "demo", [])
+    assert result["identity_state"] == "confirmed"
+    assert {c["field"] for c in result["current_version"]["conflicts"]} == {"title", "year"}
+    assert all(a["judgment"] == "unverifiable" for a in result["field_assessments"] if a["field"] in {"title", "year"})
+
+
 def test_updated_source_snapshot_reuses_version_without_self_conflict(kb):
     a = formal(pages='1--9'); old = kb.ingest([a], 'mock')[0]
     a['fields']['pages'] = '1--10'; a['raw_payload'] = {'revision': 2}
@@ -63,6 +76,19 @@ def test_preprint_formal_relation_and_current_version_semantics(kb):
     assert result['recommended_version']['fields']['year'] == '2019'
     assert 'eprint' not in result['recommended_version']['fields']
     assert any(p['proposal_type'] == 'whole_version_switch' for p in result['proposals'])
+
+
+def test_ingest_skips_unrelated_recommendations(kb, monkeypatch):
+    kb.ingest([formal()], 'mock')
+    visited = []
+    monkeypatch.setattr(kb, "_recommend", visited.append)
+    kb.ingest([], 'mock')
+    assert visited == []
+    other = formal(title="Independent publication", doi="10.1000/independent")
+    other.update(identifiers={"doi": "10.1000/independent"}, record_id="independent", relations=[])
+    source = kb.ingest([other], 'mock')[0]
+    assert visited == [kb.version(source["version_id"])["article_id"]]
+    assert len(kb.store.all("SELECT id FROM articles")) == 2
 
 
 def test_mock_never_enters_online(kb):
@@ -103,6 +129,17 @@ def test_similar_title_no_relationship_never_links(kb):
     assert len(kb.store.all('SELECT id FROM articles')) == 2
 
 
+@pytest.mark.parametrize("anchor", ["doi", "url"])
+def test_title_can_be_corrected_after_independent_identity_match(kb, anchor):
+    record = formal()
+    sources = kb.ingest([record], "mock")
+    fields = {k: record["fields"][k] for k in (anchor, "year", "author", "booktitle")}
+    fields["title"] = "Unrelated input title"
+    result = assess(kb, {"fields": fields, "entry_type": "inproceedings", "citation_key": "test"}, sources, "demo", [])
+    assert result["identity_state"] == "confirmed"
+    assert any(p["fields"].get("title") == BERT_TITLE for p in result["proposals"])
+
+
 @pytest.mark.parametrize('field,left,right', [('doi','10.1/a-b','10.1/ab'),('pages','1--23','12--3'),('url','https://a/x-y','https://a/xy')])
 def test_meaningful_punctuation_is_not_erased(field,left,right):
     assert field_normalize(field,left) != field_normalize(field,right)
@@ -110,6 +147,15 @@ def test_meaningful_punctuation_is_not_erased(field,left,right):
 
 def test_title_language_symbols_are_not_erased():
     assert normalize('C++ study') != normalize('C study')
+    assert field_normalize('title', '<scp>SummaC</scp>') == field_normalize('title', '{S}umma{C}')
+
+
+def test_publisher_pdf_eprint_does_not_override_formal_doi(kb):
+    source = kb.ingest([formal()], 'mock')[0]
+    fields = {**source['fields'], 'eprint': 'https://publisher.example/article.pdf'}
+    result = assess(kb, {'fields': fields, 'entry_type': 'inproceedings', 'citation_key': 'paper'},
+                    [source], 'demo', [])
+    assert result['current_version_id'] == source['version_id']
 
 
 def test_unsafe_copyable_proposal_is_empty():
@@ -163,3 +209,28 @@ def test_raw_response_is_kept_in_snapshot_without_copying_into_source_and_report
     assert result["identity_state"] == "confirmed"
     assert result["sources"][0]["snapshot_id"] == source["snapshot_id"]
     assert "immutable response" not in str(result)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_workshop_forum_on_main_conference_citation(kb, reverse):
+    records = []
+    for provider, forum, venue, year in [
+        ("openreview", "Workshop01", "Example Workshop", "2023"),
+        ("openreview", "MainTrack1", "Example Conference", "2024"),
+    ]:
+        url = "https://openreview.net/forum?id=" + forum
+        fields = {"title": "An example paper", "author": "Jane Smith and Adam Jones",
+                  "year": year, "entrytype": "inproceedings", "booktitle": venue, "url": url}
+        records.append({"provider": provider, "record_id": forum, "fields": fields, "source_url": url,
+                        "raw_payload": fields, "identifiers": {"openreview": forum}, "status": "mock",
+                        "identity_basis": "official_id", "source_type": "mock"})
+    records[1]["venue_id"] = "Example.org/2024/Conference"
+    sources = [kb.ingest([r], "mock")[0] for r in (records[::-1] if reverse else records)]
+    entry = {"fields": {**records[1]["fields"], "url": records[0]["source_url"]},
+             "entry_type": "inproceedings", "citation_key": "mixed"}
+    result = assess(kb, entry, sources, "demo", [])
+    assert result["identity_state"] == "confirmed"
+    assert result["recommendation_status"] == "same_version"
+    assert kb.article(result["current_version"]["article_id"])["version_count"] == 2
+    url = next(a for a in result["field_assessments"] if a["field"] == "url")
+    assert (url["judgment"], url["reference_value"]) == ("conflict", records[1]["source_url"])

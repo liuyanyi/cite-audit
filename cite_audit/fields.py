@@ -1,7 +1,7 @@
 """Versioned semantic audit vocabulary; never rewrites uploaded/source fields."""
 from dataclasses import dataclass
 
-FIELD_RULE_VERSION = "semantic-fields-v2"
+FIELD_RULE_VERSION = "semantic-fields-v3"
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,17 @@ FIELDS = (
     AuditField("url", "引用地址", ("url",)),
 )
 AUDIT_BIB_FIELDS = tuple(dict.fromkeys(name for spec in FIELDS for name in spec.aliases))
+
+
+CRITICAL_FIELDS = {"title", "authors", "publication_year", "doi", "eprint", "journal", "proceedings"}
+
+
+def required_corrections(result: dict) -> list[str]:
+    if result.get("version_status") != "current_version_confirmed":
+        return []
+    return [row["field"] for row in result.get("field_assessments", [])
+            if row.get("semantic_key") in CRITICAL_FIELDS and row.get("judgment") == "conflict"
+            and row.get("evidence")]
 
 
 def specifications(entry_type: str):

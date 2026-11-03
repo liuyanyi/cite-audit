@@ -90,6 +90,25 @@ async def completed(service, raw=RAW):
     return service.task(task['id'])
 
 
+async def test_online_discovery_failure_preserves_reusable_identity(service, monkeypatch):
+    record = {"provider": "registry", "record_id": "example", "source_type": "official", "status": "verified",
+              "identity_basis": "doi", "identifiers": {"doi": "10.1234/example"},
+              "fields": {"title": "Example", "doi": "10.1234/example", "journal": "Journal"},
+              "source_url": "https://example.org/example", "raw_payload": {"example": True},
+              "fetched_at": datetime.now(UTC).isoformat()}
+    service.knowledge.ingest([record], "online")
+    async def limited(fields, mode, settings, *, audit, cancelled):
+        await audit({"provider": "index", "status": "rate_limited", "request_count": 1})
+        return []
+    monkeypatch.setattr(service.registry, "lookup", limited)
+    tid = service.create_task(b"@article{x,title={Example},doi={10.1234/example}}", "refs.bib", "", "online")["id"]
+    await service.run_task(tid)
+    result = service.entries(tid, True)[0]
+    assert result["identity_state"] == "confirmed"
+    assert {c["provider"] for c in result["calls"]} == {"knowledge", "index"}
+    assert any("发现范围受限" in w for w in result["warnings"])
+
+
 @pytest.mark.asyncio
 async def test_single_entry_retry_preserves_original_scope_and_report(service, tmp_path, monkeypatch):
     raw = b'@string{heading = "Other paper"}\r\n' + RAW + b'@misc{other,title=heading}\r\n'
@@ -438,3 +457,42 @@ def test_listing_entries_uses_a_bounded_number_of_reads(service, monkeypatch):
     reads.clear()
     assert service.task(task["id"])["summary"]["total"] == 200
     assert len(reads) <= 4
+
+
+async def test_task_batches_arxiv_ids_with_one_remaining_request(tmp_path):
+    from urllib.parse import parse_qs, urlsplit
+    from cite_audit.policy import PROVIDERS
+    from cite_audit.sources import Response, SourceRegistry
+
+    ids = ["2101.00001v1", "2101.00002v2"]
+    requests = []
+    async def resolver(host):
+        return ["93.184.216.34"]
+    async def transport(url, addresses, timeout, limit):
+        requests.append(parse_qs(urlsplit(url).query)["id_list"][0])
+        entries = "".join(f"<entry><id>http://arxiv.org/abs/{key}</id><title>Title {key}</title>"
+                          f"<author><name>A Person</name></author></entry>" for key in reversed(ids))
+        return Response(200, {}, f'<feed xmlns="http://www.w3.org/2005/Atom">{entries}</feed>'.encode(),
+                        url, "2026-11-03T00:00:00+00:00")
+    service = AuditService(tmp_path, registry=SourceRegistry(transport=transport, resolver=resolver))
+    service.settings.update({"source_enabled": {p: p == "arxiv" for p in PROVIDERS}})
+    bib = "".join(f"@misc{{k{i},eprint={{{key}}},title={{Title {key}}},author={{A Person}}}}\n"
+                  for i, key in enumerate(ids))
+    task = service.create_task(bib.encode(), "batch.bib", "", "online", {"request_budget": 1}, confirm_budget=True)
+    await service.run_task(task["id"])
+    assert requests == [",".join(ids)]
+    calls = service.calls(task["id"])
+    assert sum(c["request_count"] for c in calls) == 1
+    assert len({c["entry_id"] for c in calls if c["provider"] == "arxiv" and c["operation"] == "result"}) == 2
+    # Start with an empty HTTP cache and expired knowledge freshness.
+    service = AuditService(tmp_path, registry=SourceRegistry(transport=transport, resolver=resolver))
+    service.settings.update({"knowledge_ttl_seconds": 0})
+    repeated = service.create_task(bib.encode(), "repeat.bib", "", "online", {}, confirm_budget=True)
+    await service.run_task(repeated["id"])
+    assert requests == [",".join(ids)]
+    reused = [c for c in service.calls(repeated["id"]) if c["provider"] == "arxiv" and c["cache_hit"]]
+    assert len(reused) == 2
+    missing = bib.replace(ids[0], "2101.00001v2")
+    mixed = service.create_task(missing.encode(), "mixed.bib", "", "online", {}, confirm_budget=True)
+    await service.run_task(mixed["id"])
+    assert requests == [",".join(ids), "2101.00001v2"]

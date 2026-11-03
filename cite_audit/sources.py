@@ -40,21 +40,22 @@ from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit
 from .assessment import current_match
 from .journals import issns
 from .knowledge import publication_type
-from .matching import iclr_paper_id, names, openreview_id, plain_title, relevance
-from .policy import CREDENTIAL_PROVIDERS, NEGATIVE_TTL_SECONDS, PROVIDERS, SETTING_LIMITS
+from .matching import iclr_paper_id, names, normalize, openreview_id, plain_title, relevance, venue_normalize
+from .policy import CREDENTIAL_PROVIDERS, NEGATIVE_TTL_SECONDS, PROVIDERS, SETTING_LIMITS, cnki_title_eligible
 from .settings import redact, secrets_from
 
 ALLOWED_HOSTS = frozenset({
     "jmlr.org", "api2.openreview.net", "api.crossref.org", "export.arxiv.org", "arxiv.org", "api.openalex.org",
-    "api.semanticscholar.org", "aclanthology.org", "proceedings.mlr.press", "proceedings.iclr.cc",
+    "api.semanticscholar.org", "aclanthology.org", "proceedings.mlr.press", "proceedings.iclr.cc", "iclr.cc",
+    "proceedings.neurips.cc", "colmweb.org", "api.datacite.org", "huggingface.co",
 })
-MIN_INTERVAL = {"iclr": 0.5, "openreview": 1.0, "tmlr": 0.5, "crossref": 0.25, "arxiv": 3.0, "openalex": 0.2,
+MIN_INTERVAL = {"hf_model": 0.5, "neurips": 0.5, "colm": 0.5, "iclr": 0.5, "openreview": 1.0, "tmlr": 0.5, "crossref": 0.25, "arxiv": 3.0, "openalex": 0.2,
                 "semantic_scholar": 1.0, "acl": 0.5, "pmlr": 0.5}
 MAX_BYTES = 2_000_000
 MAX_CACHE_BYTES = 16_000_000
 DOI_RE = re.compile(r"10\.\d{4,9}/[^\s<>\"{}]+", re.IGNORECASE)
 ARXIV_RE = re.compile(r"(?:\d{4}\.\d{4,5}|[a-z][a-z.\-]+/\d{7})(?:v\d+)?", re.IGNORECASE)
-ACL_RE = re.compile(r"(?:[A-Z]\d{2}-\d{4}|\d{4}\.[a-z][a-z0-9_\-]*-\d+\.\d+)", re.IGNORECASE)
+ACL_RE = re.compile(r"(?:[A-Z]\d{2}-\d{4}|\d{4}\.[a-z][a-z0-9_\-]*-[a-z0-9]+\.\d+)", re.IGNORECASE)
 PMLR_RE = re.compile(r"v\d{1,4}/[a-zA-Z0-9_\-]+")
 Audit = Callable[[dict[str, Any]], Awaitable[None]]
 Cancelled = Callable[[], bool]
@@ -79,6 +80,11 @@ def normalize_arxiv(value: str) -> str:
     value = re.sub(r"^https?://(?:export\.)?arxiv\.org/(?:abs|pdf)/", "", value)
     value = value.removesuffix(".pdf")
     return value if ARXIV_RE.fullmatch(value) else ""
+
+
+def arxiv_identifier(fields: dict) -> str:
+    return (normalize_arxiv(fields.get("eprint", "") or fields.get("arxiv", ""))
+            or normalize_arxiv(fields.get("url", "")))
 
 
 def _acl_id(value: str) -> str:
@@ -326,9 +332,10 @@ class _Session:
                 gate = "openreview" if host == "api2.openreview.net" else provider
                 async with self.registry._locks.setdefault(gate, asyncio.Lock()):
                     delay = self.registry._next_request.get(gate, 0) - time.monotonic()
-                    if gate == "openreview" and delay > self.timeout:
-                        await self.event(provider, operation, "rate_limited", error="OpenReview cooldown active")
-                        raise SourceError("OpenReview cooldown active")
+                    if ((gate == "arxiv" and self.registry.arxiv_cooldown()["remaining_seconds"])
+                            or (gate == "openreview" and delay > self.timeout)):
+                        await self.event(provider, operation, "rate_limited", error=f"{gate} 限流，剩余 {math.ceil(delay)} 秒")
+                        raise SourceError(f"{gate} 限流，剩余 {math.ceil(delay)} 秒")
                     await _pause(max(0, delay), self.cancelled)
                     self.remaining -= 1
                     try:
@@ -343,13 +350,14 @@ class _Session:
                             headers["Authorization"] = f"Bearer {credential}"
                         if credential and host == "api.semanticscholar.org" and provider == "semantic_scholar":
                             headers["x-api-key"] = credential
-                        request = self.registry._transport(current, addresses, self.timeout, MAX_BYTES,
+                        byte_limit = 5_000_000 if current == "https://jmlr.org/tmlr/papers/" else MAX_BYTES
+                        request = self.registry._transport(current, addresses, self.timeout, byte_limit,
                                                            **({"headers": headers} if headers else {}))
                         response = await _interruptible(
                             request,
                             self.cancelled, self.timeout,
                         )
-                        if len(response.body) > MAX_BYTES:
+                        if len(response.body) > byte_limit:
                             raise SourceError("Response exceeds byte limit")
                         if provider == "openreview" and credential:
                             if credential.encode() in response.body:
@@ -375,7 +383,8 @@ class _Session:
                         continue
                     finally:
                         self.registry._next_request[gate] = time.monotonic() + MIN_INTERVAL[gate]
-                    if gate == "openreview" and response.status == 429:
+                    if gate in {"openreview", "arxiv"} and response.status == 429:
+                        fallback = False
                         value = response.headers.get("retry-after", "")
                         try:
                             wait = int(value)
@@ -383,8 +392,16 @@ class _Session:
                             try:
                                 wait = parsedate_to_datetime(value).timestamp() - time.time()
                             except (ValueError, TypeError, OverflowError):
-                                wait = 2 ** (attempt + 1)
-                        self.registry._next_request[gate] = time.monotonic() + max(1, wait)
+                                fallback = True
+                                wait = (self.registry._arxiv_backoff if gate == "arxiv"
+                                        else 2 ** (attempt + 1))
+                        self.registry._next_request[gate] = time.monotonic() + max(1, MIN_INTERVAL[gate], wait)
+                        if gate == "arxiv":
+                            self.registry._arxiv_until = self.registry._next_request[gate]
+                            self.registry._arxiv_origin = "local" if fallback else "server"
+                            self.registry._arxiv_backoff = min(self.registry._arxiv_backoff * 2, 3600)
+                    elif gate == "arxiv" and (200 <= response.status < 300 or response.status == 404):
+                        self.registry._arxiv_backoff = 60
                 status = ("success" if 200 <= response.status < 300 else
                           "empty" if response.status == 404 else "rate_limited" if response.status == 429 else
                           "redirect" if 300 <= response.status < 400 else "error")
@@ -396,6 +413,9 @@ class _Session:
                     if challenge:
                         status = "error"
                 error = f"HTTP {response.status}: OpenReview 要求完成访问验证" if challenge else f"HTTP {response.status}"
+                if gate == 'arxiv' and response.status == 429:
+                    origin = '本地退避' if fallback else 'Retry-After'
+                    error += f'，{origin}，{math.ceil(self.registry._next_request[gate] - time.monotonic())} 秒后可重试'
                 await self.event(provider, operation, status, request_summary=current,
                                  duration_ms=round((time.monotonic() - started) * 1000),
                                  attempt=attempt + 1, request_count=1,
@@ -406,7 +426,7 @@ class _Session:
                 if challenge:
                     raise SourceError(error)
                 if response.status in (429, 500, 502, 503, 504) and attempt < self.retries:
-                    if gate == "openreview" and response.status == 429:
+                    if gate in {"openreview", "arxiv"} and response.status == 429:
                         continue
                     try:
                         retry_after = float(response.headers.get("retry-after", 1))
@@ -427,7 +447,7 @@ class _Session:
                 ttl = _num(self.settings, "source_cache_ttl_seconds", 3600, *SETTING_LIMITS["source_cache_ttl_seconds"])
                 if response.status == 404:
                     ttl = min(ttl, NEGATIVE_TTL_SECONDS)
-                if ttl:
+                if ttl and (provider, operation) != ("arxiv", "lookup"):
                     self.registry._cache[key] = (time.monotonic() + ttl, response)
                     self.registry._trim_cache()
                 self.responses.append(response)
@@ -436,7 +456,7 @@ class _Session:
                 raise SourceError(f"HTTP {response.status}: " + (
                     "provider rejected configured credentials" if credential else
                     "keyless access unavailable; no credentials sent"))
-            raise SourceError(f"HTTP {response.status}")
+            raise SourceError(error)
         raise SourceError("Redirect limit exceeded")
 
     async def json(self, provider: str, operation: str, url: str) -> tuple[Any, Response]:
@@ -532,12 +552,16 @@ class _HTML(HTMLParser):
         self.links: list[tuple[str, str]] = []
         self.blocks: list[str] = []
         self.citation: dict[str, list[str]] = {}
+        self.structured_data: list[str] = []
+        self._json_script = False
         self._link: list[str] | None = None
         self._block: list[str] | None = None
         self._block_depth = 0
 
     def handle_starttag(self, tag, attrs):
         values = dict(attrs)
+        if tag == "script":
+            self._json_script = values.get("type") == "application/ld+json"
         if tag == "meta" and (values.get("name") or "").startswith("citation_") and values.get("content"):
             self.citation.setdefault(values["name"], []).append(values["content"])
         if tag == "a" and values.get("href"):
@@ -548,12 +572,16 @@ class _HTML(HTMLParser):
             self._block_depth += 1
 
     def handle_data(self, data):
+        if self._json_script:
+            self.structured_data.append(data)
         if self._link is not None:
             self._link[1] += data
         if self._block is not None:
             self._block.append(data)
 
     def handle_endtag(self, tag):
+        if tag == "script":
+            self._json_script = False
         if tag == "a" and self._link is not None:
             self.links.append((self._link[0], clean(self._link[1])))
             self._link = None
@@ -632,14 +660,20 @@ def parse_official_bib(text: str) -> dict[str, str]:
 class SourceRegistry:
     def __init__(self, *, transport: Callable[..., Awaitable[Response]] | None = None,
                  resolver: Callable[[str], Awaitable[list[str]]] | None = None):
+        self.cnki_browser = None
         self._transport = transport or public_transport
         self._resolver = resolver or resolve_public
         self._cache: OrderedDict[tuple, tuple[float, Response]] = OrderedDict()
         self._locks: dict[str, asyncio.Lock] = {}
+        self._arxiv_until = 0.0
+        self._arxiv_origin = "local"
+        self._arxiv_backoff = 60
         self._next_request: dict[str, float] = {}
 
     def clear_cache(self) -> int:
         count = len(self._cache)
+        if self.cnki_browser:
+            count += self.cnki_browser.clear_cache()
         self._cache.clear()
         return count
 
@@ -678,6 +712,10 @@ class SourceRegistry:
                 break
         return records
 
+    def arxiv_cooldown(self) -> dict:
+        return {"remaining_seconds": max(0, math.ceil(self._arxiv_until - time.monotonic())),
+                "origin": self._arxiv_origin}
+
     async def lookup(self, fields: dict[str, str], mode: str, settings: dict, *, audit: Audit,
                      cancelled: Cancelled) -> list[dict]:
         if mode not in {"online", "mock"}:
@@ -689,21 +727,44 @@ class SourceRegistry:
         if mode == "mock":
             return await self._mock(fields, session)
         enabled = settings.get("source_enabled", {})
-        active = {provider for provider in PROVIDERS if enabled.get(provider, True)}
-        records: list[dict] = []
+        active = {provider for provider in PROVIDERS if enabled.get(provider, provider != "cnki")}
+        records: list[dict] = list(settings.get("task_cnki_records", []))
         # Requests contain only bounded identifier/title/first-author query hints.
         hints = {k.lower(): clean(v)[:1500] for k, v in fields.items() if isinstance(v, str)}
         if hints.get("entrytype") == "patent" or re.fullmatch(r"CN\d{8,}[A-Z]\d?", hints.get("edition", ""), re.IGNORECASE):
             await session.event("coverage", "discovery", "unsupported",
                                 error="当前来源不覆盖专利身份核验，未将专利送入论文搜索")
             return []
-        for provider in PROVIDERS:
+        venue = venue_normalize(hints.get("booktitle"))
+        directory = {"iclr": "iclr", "neurips": "neurips", "colm": "colm", "icml": "pmlr",
+                     "acl": "acl", "naacl": "acl", "emnlp": "acl"}.get(venue)
+        if not hints.get("title") or not re.fullmatch(r"\d{4}", hints.get("year", "")):
+            directory = None
+        selected = []
+        skipped = {}
+        for provider in sorted(PROVIDERS, key=lambda name: name != directory):
             if provider not in active:
-                continue
-            if provider == "iclr" and not iclr_paper_id(hints.get("url", "")):
-                continue
-            if provider == "openreview" and not openreview_id(hints.get("url", "")):
-                continue
+                skipped[provider] = "来源已禁用"
+            elif provider == "cnki" and not cnki_title_eligible(hints.get("title", "")):
+                skipped[provider] = "知网仅检索中文题名"
+            elif provider == "hf_model" and not normalize_doi(hints.get("doi", "")).startswith("10.57967/hf/"):
+                skipped[provider] = "输入未提供 Hugging Face 模型 DOI"
+            elif provider in {"neurips", "colm"} and provider != directory:
+                skipped[provider] = "会场、题名或年份不满足目录检索条件"
+            elif (provider == "iclr" and not iclr_paper_id(hints.get("url", "")) and
+                    not (venue_normalize(hints.get("booktitle")) == "iclr" and hints.get("title")
+                         and re.fullmatch(r"\d{4}", hints.get("year", "")))):
+                skipped[provider] = "没有 ICLR 论文集标识，且不满足目录检索条件"
+            elif provider == "openreview" and not openreview_id(hints.get("url", "")):
+                skipped[provider] = "输入 URL 未提供 OpenReview 论坛标识"
+            else:
+                selected.append(provider)
+        await session.event("discovery", "来源调度", "success",
+                            message="按顺序进入来源适配器；实际请求见后续记录。",
+                            request_summary=json.dumps({"调度顺序": selected, "跳过原因": skipped,
+                                                        "优先会场目录": directory if directory in selected else None},
+                                                       ensure_ascii=False))
+        for provider in selected:
             if cancelled():
                 await session.event(provider, "lookup", "cancelled", error="Lookup cancelled")
                 break
@@ -713,8 +774,12 @@ class SourceRegistry:
                 records.extend(found)
                 if not found:
                     for key, (expiry, response) in list(self._cache.items()):
-                        if response in session.responses:
+                        if key[0] != "arxiv-id" and response in session.responses:
                             self._cache[key] = (min(expiry, time.monotonic() + NEGATIVE_TTL_SECONDS), response)
+                if not found and not session.responses and not (provider == "cnki" and hints.get("title")):
+                    await session.event(provider, "来源调度", "success",
+                                        message="适配器未发起查询，未取得此来源的检索结论。")
+                    continue
                 await session.event(provider, "result", "success" if found else "empty", record_count=len(found),
                                     response_summary=_result_summary(found))
             except BudgetExceeded as exc:
@@ -736,15 +801,20 @@ class SourceRegistry:
         # metadata and input identifiers alone never establish factual identity.
         if "crossref" in active and not cancelled():
             known = {r["identifiers"].get("doi") for r in records if r["provider"] == "crossref"}
-            targets = []
+            targets = {}
             for record in records:
                 if relevance(hints, record)["status"] == "rejected":
                     continue
-                targets.append(record["identifiers"].get("doi"))
-                targets.extend(r.get("target_identifiers", {}).get("doi") for r in record.get("relations", []))
-            for doi in list(dict.fromkeys(d for d in targets if d and d not in known))[:session.limit]:
+                for doi in [record["identifiers"].get("doi"), *(r.get("target_identifiers", {}).get("doi")
+                            for r in record.get("relations", []))]:
+                    if doi and doi not in known:
+                        targets.setdefault(doi, record)
+            for doi, origin in list(targets.items())[:session.limit]:
                 session.partial, session.responses = [], []
                 try:
+                    await session.event("crossref", "候选 DOI 回查", "success",
+                                        message=f"根据 {origin['provider']} 记录中的 DOI 线索安排回查。",
+                                        request_summary=json.dumps({"doi": doi, "record_id": origin["record_id"]}))
                     records.extend(await self._crossref({"doi": doi}, records, session))
                 except LookupCancelled:
                     break
@@ -756,6 +826,26 @@ class SourceRegistry:
                     await session.event("crossref", "candidate_resolution", "error",
                                         error="Candidate DOI could not be verified")
         return list({(r["provider"], r["record_id"]): r for r in records}.values())
+
+    async def cnki_task(self, titles, config, audit, remaining, cancelled):
+        from .cnki import BrowserSession, task_lookup
+        if self.cnki_browser is None:
+            self.cnki_browser = BrowserSession()
+
+        def make_session(title):
+            entry = titles[title][0]
+            session = _Session(self, {**config, "max_source_requests": remaining(entry)},
+                               lambda event: audit(entry, event), cancelled)
+            session.query = {"title": title}
+            return session
+
+        return await task_lookup(titles, make_session, self.cnki_browser, cancelled)
+
+    async def _cnki(self, fields: dict, records: list, session: _Session) -> list:
+        from .cnki import BrowserSession, lookup
+        if self.cnki_browser is None:
+            self.cnki_browser = BrowserSession()
+        return await lookup(fields, session, self.cnki_browser)
 
     async def _crossref(self, fields: dict, records: list, session: _Session) -> list:
         results = session.partial
@@ -771,6 +861,7 @@ class SourceRegistry:
             urls.append(("search", "https://api.crossref.org/works?" + urlencode(params)))
         for operation, url in urls:
             if operation == "search" and self._formal_match(fields, results):
+                await session.event("crossref", "来源调度", "success", message="DOI 已匹配正式版，跳过本源题名搜索。")
                 continue
             data, response = await session.json("crossref", operation, url)
             if data is None:
@@ -785,16 +876,34 @@ class SourceRegistry:
         return results
 
     async def _arxiv(self, fields: dict, records: list, session: _Session) -> list:
-        identifier = normalize_arxiv(fields.get("eprint", "") or fields.get("arxiv", ""))
-        if not identifier:
-            identifier = normalize_arxiv(fields.get("url", ""))
-        if not identifier and self._formal_match(fields, records):
-            return []
+        identifier = arxiv_identifier(fields)
+        requested = [identifier] if identifier else []
+        batch = session.settings.get("arxiv_batch_results", {})
+        def cached(key):
+            if key in batch:
+                return batch[key]
+            hit = self._cache.get(("arxiv-id", key))
+            if hit and hit[0] > time.monotonic() and not session.settings.get("force_refresh"):
+                return hit[1]
+            return None
         params: dict[str, Any] = {"max_results": session.limit}
         if identifier:
-            params["id_list"] = identifier
+            response = cached(identifier)
+            if response is not None:
+                batch[identifier] = response
+            if response is None:
+                for other in session.settings.get("arxiv_batch_ids", []):
+                    if other != identifier and cached(other) is None:
+                        requested.append(other)
+                    if len(requested) >= 20:
+                        break
+                params.update(id_list=",".join(requested), max_results=len(requested))
+            else:
+                await session.event("arxiv", "lookup", "success", cache_hit=True,
+                                    request_summary=identifier, fetched_at=response.fetched_at)
+                session.responses.append(response)
         elif fields.get("title"):
-            title = re.sub(r'["{}\\]', " ", fields["title"][:400])
+            title = " ".join(re.sub(r'["{}\\]', " ", fields["title"][:400]).split())
             params["search_query"] = f'ti:"{title}"'
             if fields.get("author"):
                 first = next(iter(names(fields["author"])), "")
@@ -806,9 +915,18 @@ class SourceRegistry:
                     params["search_query"] += ' AND (' + ' OR '.join(f'au:"{w}"' for w in hints) + ')'
         else:
             return []
-        response = await session.get("arxiv", "lookup" if identifier else "search",
-                                     "https://export.arxiv.org/api/query?" + urlencode(params))
+        fetched = not identifier or response is None
+        if fetched:
+            response = await session.get("arxiv", "lookup" if identifier else "search",
+                                         "https://export.arxiv.org/api/query?" + urlencode(params))
         if response.status == 404:
+            if identifier and fetched:
+                ttl = min(NEGATIVE_TTL_SECONDS, session.settings.get("source_cache_ttl_seconds", 3600))
+                for key in requested:
+                    batch[key] = response
+                    if ttl:
+                        self._cache[("arxiv-id", key)] = (time.monotonic() + ttl, response)
+                self._trim_cache()
             return []
         # Never resolve XML entities or DTDs supplied by remote data.
         if b"<!DOCTYPE" in response.body.upper() or b"<!ENTITY" in response.body.upper():
@@ -818,11 +936,26 @@ class SourceRegistry:
         if root.tag != "{http://www.w3.org/2005/Atom}feed":
             raise SourceError("arXiv response is not an Atom feed")
         found = session.partial
-        for entry in root.findall("a:entry", ns)[:session.limit]:
+        entries = root.findall("a:entry", ns)
+        returned = {normalize_arxiv(entry.findtext("a:id", "", ns)) for entry in entries}
+        if any("errors" in entry.findtext("a:id", "", ns) for entry in entries):
+            raise SourceError("arXiv returned an API error entry")
+        def matches(key, actual):
+            return key == actual or key == re.sub(r"v\d+$", "", actual)
+        if identifier and fetched:
+            ttl = _num(session.settings, "source_cache_ttl_seconds", 3600, *SETTING_LIMITS["source_cache_ttl_seconds"])
+            for key in requested:
+                batch[key] = response
+                lifetime = ttl if any(matches(key, actual) for actual in returned) else min(ttl, NEGATIVE_TTL_SECONDS)
+                if lifetime:
+                    self._cache[("arxiv-id", key)] = (time.monotonic() + lifetime, response)
+            self._trim_cache()
+        target = identifier
+        for entry in entries if target else entries[:session.limit]:
             identifier = normalize_arxiv(entry.findtext("a:id", "", ns))
             if not identifier:
-                if "errors" in entry.findtext("a:id", "", ns):
-                    raise SourceError("arXiv returned an API error entry")
+                continue
+            if target and not matches(target, identifier):
                 continue
             url = f"https://arxiv.org/abs/{identifier}"
             publication_doi = normalize_doi(entry.findtext("x:doi", "", ns))
@@ -842,7 +975,9 @@ class SourceRegistry:
         urls = []
         if doi:
             urls.append(("lookup", f"https://api.openalex.org/works/https://doi.org/{quote(doi, safe='/')}"))
-        if fields.get("title") and not self._formal_match(fields, records):
+        if fields.get("title") and self._formal_match(fields, records):
+            await session.event("openalex", "来源调度", "success", message="已有匹配的正式版，跳过题名搜索。")
+        elif fields.get("title"):
             params["search"] = fields["title"][:500]
             urls.append(("search", "https://api.openalex.org/works?" + urlencode(params)))
         results = session.partial
@@ -875,7 +1010,9 @@ class SourceRegistry:
         if identifier:
             urls.append(("lookup", "https://api.semanticscholar.org/graph/v1/paper/" +
                          quote(identifier, safe="") + "?" + urlencode({"fields": selection})))
-        if fields.get("title") and not self._formal_match(fields, records):
+        if fields.get("title") and self._formal_match(fields, records):
+            await session.event("semantic_scholar", "来源调度", "success", message="已有匹配的正式版，跳过题名搜索。")
+        elif fields.get("title"):
             urls.append(("search", "https://api.semanticscholar.org/graph/v1/paper/search?" + urlencode({
                 "query": fields["title"][:500], "limit": session.limit, "fields": selection})))
         results = session.partial
@@ -907,22 +1044,34 @@ class SourceRegistry:
         return any(r.get("status") == "verified" and publication_type(r) in {"journal", "conference"}
                    and current_match(fields, r)[0] for r in records)
 
-    def _official_hints(self, provider: str, fields: dict, records: list) -> list[str]:
+    def _official_hints(self, provider: str, fields: dict, records: list) -> dict[str, str]:
         extract = _acl_id if provider == "acl" else _pmlr_id
-        values = [fields.get(provider, ""), fields.get("url", ""), fields.get("doi", "")]
+        hints = {identifier: "Bib 输入" for key in (provider, "url", "doi")
+                 if (identifier := extract(fields.get(key, "")))}
         for record in records:
             if relevance(fields, record)["status"] == "rejected":
                 continue
-            values += [record["identifiers"].get(provider, ""), record["identifiers"].get("doi", ""),
+            values = [record["identifiers"].get(provider, ""), record["identifiers"].get("doi", ""),
                        record["fields"].get("url", "")]
             values += record["raw_payload"].get("upstream_urls", [])
             values += [r.get("target_identifiers", {}).get("doi", "") for r in record.get("relations", [])]
-        return list(dict.fromkeys(identifier for v in values if (identifier := extract(v))))
+            for value in values:
+                if identifier := extract(value):
+                    hints.setdefault(identifier, f"{record['provider']} / {record['record_id']}")
+        return hints
+
+    async def _directory_ids(self, provider: str, fields: dict, records: list, session: _Session) -> list[str]:
+        hints = self._official_hints(provider, fields, records)
+        ids = list(hints)[:session.limit]
+        if ids:
+            await session.event(provider, "论文集标识回查", "success", message="按以下标识及其来源查询官方论文集。",
+                                request_summary=json.dumps({i: hints[i] for i in ids}, ensure_ascii=False))
+        return ids
 
     async def _iclr(self, fields: dict, records: list, session: _Session) -> list:
         identifier = iclr_paper_id(fields.get("url", ""))
         if not identifier:
-            return []
+            return await self._iclr_directory(fields, session)
         year, paper = identifier.split("/")
         url = f"https://proceedings.iclr.cc/paper_files/paper/{year}/hash/{paper}-Abstract-Conference.html"
         response = await session.get("iclr", "fetch_publication", url)
@@ -945,6 +1094,144 @@ class SourceRegistry:
             bib["pages"] = values["citation_firstpage"] + "--" + values["citation_lastpage"]
         return [_record("iclr", identifier, url, "official", bib, {"iclr": identifier}, _snapshot(response))]
 
+    async def _iclr_directory(self, fields: dict, session: _Session) -> list:
+        year = fields["year"]
+        forum = openreview_id(fields.get("url", ""))
+        if year == "2020" and forum:
+            url = f"https://iclr.cc/virtual_{year}/poster_{forum}.html"
+            response = await session.get("iclr", "fetch_publication", url)
+            if response.status == 200:
+                page = _HTML()
+                page.feed(response.body.decode("utf-8"))
+                meta = page.citation
+                title = next(iter(meta.get("citation_title", [])), "")
+                venue = next(iter(meta.get("citation_conference_title", [])), "")
+                date = next(iter(meta.get("citation_publication_date", [])), "")
+                if (normalize(title) == normalize(fields["title"]) and venue_normalize(venue) == "iclr"
+                        and _year(date) == year and meta.get("citation_author")
+                        and any(openreview_id(link) == forum for link, _ in page.links)):
+                    bib = {"entrytype": "inproceedings", "title": title, "author": " and ".join(meta["citation_author"]),
+                           "booktitle": venue, "year": year, "url": f"https://openreview.net/forum?id={forum}"}
+                    return [_record("iclr", forum, url, "official", bib, {"openreview": forum}, _snapshot(response))]
+        directory = await session.get("iclr", "search", f"https://iclr.cc/Downloads/{year}")
+        if directory.status == 404:
+            return []
+        page = _HTML()
+        page.feed(directory.body.decode("utf-8"))
+        title = normalize(fields["title"])
+        paths = list(dict.fromkeys(path for path, label in page.links if normalize(label) == title
+                     and re.fullmatch(rf"/virtual/{year}/(?:poster|oral|spotlight)/\d+", path)))
+        if len(paths) > session.limit:
+            raise SourceError("Multiple ICLR directory entries match this title")
+        for path in paths:
+            url = "https://iclr.cc" + path
+            response = await session.get("iclr", "fetch_publication", url)
+            if response.status == 404:
+                continue
+            body = response.body.decode("utf-8")
+            detail = _HTML()
+            detail.feed(body)
+            for raw in detail.structured_data:
+                work = json.loads(raw)
+                if not (isinstance(work, dict) and work.get("@type") == "CreativeWork"
+                        and work.get("creditText") == f"ICLR {year}" and normalize(work.get("name")) == title):
+                    continue
+                authors = work.get("author")
+                if not isinstance(authors, list) or not authors or not all(
+                        isinstance(a, dict) and isinstance(a.get("name"), str) and a["name"].strip() for a in authors):
+                    continue
+                forums = {identifier for link, _ in detail.links if (identifier := openreview_id(link))}
+                ids = {"openreview": next(iter(forums))} if len(forums) == 1 else {"iclr": path}
+                bib = {"entrytype": "inproceedings", "title": work["name"], "author": " and ".join(a["name"] for a in authors),
+                       "booktitle": "International Conference on Learning Representations", "year": year,
+                       "url": f"https://openreview.net/forum?id={ids['openreview']}" if "openreview" in ids else url}
+                session.partial.append(_record("iclr", path, url, "official", bib, ids, _snapshot(response)))
+                break
+        return session.partial
+
+    async def _hf_model(self, fields: dict, records: list, session: _Session) -> list:
+        doi = normalize_doi(fields["doi"])
+        registry_url = f"https://api.datacite.org/dois/{quote(doi, safe='/')}"
+        data, response = await session.json("hf_model", "lookup", registry_url)
+        if not data:
+            return []
+        attributes = data["data"]["attributes"]
+        repo = attributes.get("url", "").rstrip("/")
+        if (normalize_doi(attributes.get("doi", "")) != doi
+                or attributes.get("types", {}).get("resourceTypeGeneral") != "Model"
+                or not re.fullmatch(r"https://huggingface\.co/[\w.-]+/[\w.-]+", repo)):
+            return []
+        titles = attributes.get("titles", [])
+        if not titles or not titles[0].get("title"):
+            raise SourceError("DataCite model record has no registered title")
+        common = {"title": titles[0]["title"], "doi": doi, "url": repo,
+                  "year": attributes.get("publicationYear"), "publisher": attributes.get("publisher")}
+        session.partial.append(_record("hf_model", doi, registry_url, "registry", common, {"doi": doi}, _snapshot(response)))
+        card = await session.get("hf_model", "fetch_citation", repo + "/raw/main/README.md")
+        if card.status == 200:
+            for block in re.findall(r"(?ims)^```(?:bibtex|bib)?[ \t]*\r?\n([ \t]*@[a-z]+\s*\{.*?)^```", card.body.decode("utf-8")):
+                bib = parse_official_bib(block)
+                if (normalize_doi(bib.get("doi", "")) == doi and bib.get("url", "").strip().rstrip("/") == repo
+                        and bib.get("title") and bib.get("author")):
+                    session.partial.append(_record("hf_model", repo, repo, "official",
+                                                   {k: v for k, v in bib.items() if k != "entrytype"},
+                                                   {"doi": doi}, _snapshot(card)))
+                    break
+        return session.partial
+
+    async def _neurips(self, fields: dict, records: list, session: _Session) -> list:
+        year = fields["year"]
+        root = "https://proceedings.neurips.cc"
+        response = await session.get("neurips", "search", f"{root}/paper/{year}")
+        page = _HTML()
+        page.feed(response.body.decode("utf-8"))
+        for href, title in page.links:
+            if normalize(title) != normalize(fields["title"]):
+                continue
+            match = re.fullmatch(rf"/paper_files/paper/{year}/hash/([a-f0-9]{{32}})-Abstract(-Conference)?\.html", href)
+            if not match:
+                continue
+            url = root + href
+            paper = await session.get("neurips", "fetch_publication", url)
+            detail = _HTML()
+            detail.feed(paper.body.decode("utf-8"))
+            meta = {k: v[0] for k, v in detail.citation.items()}
+            pdf = root + href.replace("/hash/", "/file/").replace("-Abstract", "-Paper").replace(".html", ".pdf")
+            if (meta.get("citation_pdf_url") != pdf or _year(meta.get("citation_publication_date")) != year
+                    or venue_normalize(meta.get("citation_journal_title")) != "neurips"
+                    or normalize(meta.get("citation_title")) != normalize(title) or not meta.get("citation_author")):
+                raise SourceError("NeurIPS metadata does not confirm this proceedings record")
+            bib = {"entrytype": "inproceedings", "title": meta["citation_title"], "url": url,
+                   "author": " and ".join(detail.citation["citation_author"]), "year": year,
+                   "booktitle": meta["citation_journal_title"], "volume": meta.get("citation_volume")}
+            if meta.get("citation_firstpage") and meta.get("citation_lastpage"):
+                bib["pages"] = meta["citation_firstpage"] + "--" + meta["citation_lastpage"]
+            session.partial.append(_record("neurips", match[1], url, "official", bib,
+                                           {"neurips": match[1]}, _snapshot(paper)))
+        return session.partial
+
+    async def _colm(self, fields: dict, records: list, session: _Session) -> list:
+        year = fields["year"]
+        url = f"https://colmweb.org/{year}/AcceptedPapers.html"
+        response = await session.get("colm", "search", url)
+        if response.status == 404:
+            return []
+        for paragraph in re.findall(r"<p\b[^>]*>(.*?)</p>", response.body.decode("utf-8"), re.I | re.S):
+            page = _HTML()
+            page.feed(paragraph)
+            authors = re.search(r"<em>([^<>]+)</em>", paragraph, re.I)
+            if not authors:
+                continue
+            for href, title in page.links:
+                forum = openreview_id(href)
+                if forum and normalize(title) == normalize(fields["title"]):
+                    bib = {"entrytype": "inproceedings", "title": title, "year": year,
+                           "booktitle": "Conference on Language Modeling", "url": href,
+                           "author": " and ".join(a.strip() for a in html.unescape(authors[1]).split(","))}
+                    session.partial.append(_record("colm", forum, url, "official", bib,
+                                                   {"openreview": forum}, _snapshot(response)))
+        return session.partial
+
     async def _openreview(self, fields: dict, records: list, session: _Session) -> list:
         identifier = openreview_id(fields.get("url", ""))
         if not identifier:
@@ -956,7 +1243,29 @@ class SourceRegistry:
         notes = data["notes"]
         if len(notes) != 1 or notes[0].get("id") != identifier or notes[0].get("forum") != identifier:
             raise SourceError("OpenReview response does not match requested submission")
-        note = notes[0]
+        record = self._forum_record(identifier, notes[0], response)
+        found = [record]
+        actual = record["fields"]
+        if (record["publication_state"] == "accepted" and normalize(fields.get("title", "")) == normalize(actual["title"])
+                and any(fields.get(k) and actual.get(k) and venue_normalize(fields[k]) != venue_normalize(actual[k])
+                        for k in ("year", "booktitle"))):
+            params = {"content.title": actual["title"], "limit": session.limit}
+            try:
+                result, snapshot = await session.json("openreview", "search_title", "https://api2.openreview.net/notes?" + urlencode(params))
+            except (LookupCancelled, BudgetExceeded):
+                raise
+            except SourceError:
+                return found
+            for note in (result or {}).get("notes", [])[:session.limit]:
+                other = note.get("forum", "")
+                if other != identifier and other == note.get("id") and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", other):
+                    candidate = self._forum_record(other, note, snapshot)
+                    if candidate["publication_state"] == "accepted":
+                        found.append(candidate)
+        return found
+
+    @staticmethod
+    def _forum_record(identifier, note, response):
         content = {key: item.get("value") for key, item in note["content"].items() if isinstance(item, dict)}
         title, authors = content.get("title"), content.get("authors")
         if not isinstance(title, str) or not title or not isinstance(authors, list) or not authors:
@@ -983,9 +1292,11 @@ class SourceRegistry:
                 ids["doi"] = normalize_doi(metadata["doi"])
         record = _record("openreview", identifier, forum, "official", metadata, ids, _snapshot(response))
         record["publication_state"] = "accepted" if accepted else "submission"
+        if accepted:
+            record["venue_id"] = venue
         if not accepted:
             record.update(status="candidate", identity_basis="candidate")
-        return [record]
+        return record
 
     async def _tmlr(self, fields: dict, records: list, session: _Session) -> list:
         journal = "Transactions on Machine Learning Research"
@@ -999,10 +1310,21 @@ class SourceRegistry:
                 value = note.get("id", "")
                 if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value):
                     ids.append(value)
-        for value in dict.fromkeys(ids):
+        pending = list(dict.fromkeys(ids))
+        for value in pending:
             url = f"https://jmlr.org/tmlr/papers/bib/{value}.bib"
             response = await session.get("tmlr", "fetch_publication", url)
             if response.status == 404:
+                if (value == identifier and fields.get("journal", "").casefold() in {journal.casefold(), "tmlr"}
+                        and fields.get("title")):
+                    directory = await session.get("tmlr", "search_title", "https://jmlr.org/tmlr/papers/")
+                    page = _HTML()
+                    page.feed(directory.body.decode("utf-8"))
+                    alternatives = {other for href, label in page.links
+                                    if normalize(label) == normalize(fields["title"])
+                                    and (other := openreview_id(href)) and other not in pending}
+                    if len(alternatives) <= session.limit:
+                        pending.extend(sorted(alternatives))
                 continue
             bib = parse_official_bib(response.body.decode("utf-8"))
             if (bib.get("journal", "").casefold() != journal.casefold()
@@ -1014,7 +1336,27 @@ class SourceRegistry:
         return session.partial
 
     async def _acl(self, fields: dict, records: list, session: _Session) -> list:
-        ids = self._official_hints("acl", fields, records)[:session.limit]
+        ids = await self._directory_ids("acl", fields, records, session)
+        venue = venue_normalize(fields.get("booktitle"))
+        year = fields.get("year", "")
+        if not ids and venue in {"acl", "emnlp", "naacl"} and fields.get("title") and re.fullmatch(r"\d{4}", year):
+            volume = None
+            if int(year) >= 2020:
+                volume = await session.get("acl", "search", f"https://aclanthology.org/volumes/{year}.{venue}-main.bib")
+            if volume and volume.status == 200:
+                for entry in re.split(r"(?m)(?=^@)", volume.body.decode("utf-8")):
+                    bib = parse_official_bib(entry)
+                    if normalize(bib.get("title")) == normalize(fields["title"]):
+                        identifier = _acl_id(bib.get("url", ""))
+                        if identifier:
+                            ids.append(identifier)
+            else:
+                response = await session.get("acl", "search", f"https://aclanthology.org/events/{venue}-{year}/")
+                page = _HTML()
+                page.feed(response.body.decode("utf-8"))
+                ids = list(dict.fromkeys(identifier for href, label in page.links
+                           if normalize(label) == normalize(fields["title"])
+                           and (identifier := _acl_id(urljoin(response.url, href)))))[:session.limit]
         if not ids:
             await session.event("acl", "discovery", "unsupported", error=(
                 "No official record located through enabled indexes; no general ACL search endpoint used"))
@@ -1038,13 +1380,29 @@ class SourceRegistry:
         return results
 
     async def _pmlr(self, fields: dict, records: list, session: _Session) -> list:
-        ids = self._official_hints("pmlr", fields, records)
+        ids = await self._directory_ids("pmlr", fields, records, session)
         volume = fields.get("volume", "")
+        if (not ids and venue_normalize(fields.get("booktitle")) == "icml" and fields.get("title")
+                and re.fullmatch(r"\d{4}", fields.get("year", ""))):
+            index = await session.get("pmlr", "search", "https://proceedings.mlr.press/")
+            for row in re.findall(r"<li\b[^>]*>(.*?)</li>", index.body.decode("utf-8"), re.I | re.S):
+                label = clean(re.sub(r"<[^>]+>", " ", row))
+                match = re.fullmatch(rf"Volume (\d+) Proceedings of ICML {fields['year']}", label, re.I)
+                if match:
+                    volume = match[1]
+                    break
         if not ids and fields.get("title") and re.fullmatch(r"\d{1,4}", volume):
             response = await session.get("pmlr", "search_volume", f"https://proceedings.mlr.press/v{volume}/")
             if response.status != 404:
                 page = _HTML()
                 page.feed(response.body.decode("utf-8"))
+                for block in re.split(r'<div\s+class="paper">', response.body.decode("utf-8"))[1:]:
+                    heading = re.search(r'<p\s+class="title">(.*?)</p>', block, re.S)
+                    if heading and normalize(re.sub(r"<[^>]+>", "", heading[1])) == normalize(fields["title"]):
+                        paper = _HTML()
+                        paper.feed(block)
+                        ids.extend(identifier for href, label in paper.links if label == "abs"
+                                   and (identifier := _pmlr_id(urljoin(response.url, href))))
                 title_words = set(re.findall(r"\w+", fields["title"].lower()))
                 scored = []
                 for href, label in page.links:

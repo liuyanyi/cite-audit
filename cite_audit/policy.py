@@ -1,11 +1,29 @@
 """Shared source metadata and configuration limits."""
 
+import re
+
 from .bib import MAX_BYTES, MAX_ENTRIES
 
+
+def cnki_search_title(title: str) -> str:
+    # BibTeX groups control capitalization; escaped braces are literal title characters.
+    text = re.sub(r"\\([{}])|[{}]", lambda match: match.group(1) or "", title)
+    return " ".join(text.split())[:1500]
+
+
+def cnki_title_eligible(title: str) -> bool:
+    """Accept titles containing Han characters, excluding visible kana or Hangul."""
+    return bool(re.search(r"[㐀-䶿一-鿿\uf900-\ufaff\U00020000-\U0002FA1F\U00030000-\U000323AF]", title)
+                and not re.search(r"[ぁ-ヿｦ-ﾟ가-힣ᄀ-ᇿㄱ-ㆎ]", title))
+
+
 SOURCE_NAMES = {
+    "hf_model": "DataCite / Hugging Face",
     "iclr": "ICLR Proceedings",
+    "neurips": "NeurIPS Proceedings", "colm": "COLM",
     "openreview": "OpenReview",
     "tmlr": "TMLR",
+    "cnki": "中国知网",
     "crossref": "Crossref", "arxiv": "arXiv", "openalex": "OpenAlex",
     "semantic_scholar": "Semantic Scholar", "acl": "ACL Anthology", "pmlr": "PMLR",
 }

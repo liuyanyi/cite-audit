@@ -19,6 +19,16 @@ from .service import AuditService, BudgetConfirmationRequired
 from .storage import load
 
 
+class RetrySelection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    revision: int = Field(ge=1)
+    scope: str
+    categories: list[str] | None = None
+    entry_ids: list[str] | None = None
+    entry_request_budget: int | None = None
+    request_budget: int | None = None
+
+
 class ExportChoice(BaseModel):
     model_config = ConfigDict(extra="forbid")
     entry_id: str
@@ -52,9 +62,14 @@ def create_app(data_dir: str | Path | None = None, start_worker: bool = True, re
     async def lifespan(app):
         if start_worker:
             await service.start()
-        yield
-        if start_worker:
-            await service.stop()
+        try:
+            yield
+        finally:
+            if start_worker:
+                await service.stop()
+            browser = getattr(service.registry, "cnki_browser", None)
+            if browser is not None:
+                await browser.close()
 
     app = FastAPI(title="Cite Audit", version=__version__, lifespan=lifespan,
                   description="Local single-user evidence-first bibliography auditor. Demo is not online verification.")
@@ -86,6 +101,10 @@ def create_app(data_dir: str | Path | None = None, start_worker: bool = True, re
     async def budget_confirmation(_request, exc):
         return JSONResponse({"error": {"code": "budget_confirmation_required", "message": str(exc),
                                        "details": exc.details}}, 409)
+
+    @app.get("/api/sources/arxiv/cooldown")
+    async def arxiv_cooldown():
+        return service.registry.arxiv_cooldown()
 
     @app.get("/api/health")
     def health():
@@ -132,9 +151,9 @@ def create_app(data_dir: str | Path | None = None, start_worker: bool = True, re
     @app.get("/api/tasks/{task_id}/entries")
     def entries(task_id: str, q: str = "", identity_state: str = "", recommendation_status: str = "",
                 has_conflict: bool = False, sort: str = "ordinal", page: int = 1, page_size: int = 25,
-                classification: str = ""):
+                classification: str = "", needs_correction: bool = False, execution_status: str = ""):
         return service.entry_page(task_id, q, identity_state, recommendation_status, has_conflict, sort, page, page_size,
-                                  classification)
+                                  classification, needs_correction, execution_status)
 
     @app.get("/api/tasks/{task_id}/entries/{entry_id}")
     def entry(task_id: str, entry_id: str):
@@ -165,8 +184,19 @@ def create_app(data_dir: str | Path | None = None, start_worker: bool = True, re
         return service.cancel(task_id)
 
     @app.post("/api/tasks/{task_id}/retry")
-    def retry(task_id: str):
-        return service.retry(task_id)
+    def retry(task_id: str, selection: RetrySelection | None = None):
+        if selection is None:
+            return service.retry(task_id)
+        expected = {"all": (False, False), "categories": (True, False), "entries": (False, True)}
+        if expected.get(selection.scope) != (selection.categories is not None, selection.entry_ids is not None):
+            raise ValueError("重新核查范围与选择不一致")
+        return service.retry(task_id, revision=selection.revision, categories=selection.categories,
+                             entry_ids=selection.entry_ids, budgets=selection.model_dump(
+                                 include={"entry_request_budget", "request_budget"}, exclude_none=True))
+
+    @app.post("/api/tasks/{task_id}/retry-unverifiable")
+    def retry_unverifiable(task_id: str):
+        return service.retry_unverifiable(task_id)
 
     @app.delete("/api/tasks/{task_id}")
     def delete(task_id: str):
@@ -263,15 +293,22 @@ def create_app(data_dir: str | Path | None = None, start_worker: bool = True, re
         config = service.settings.get()
         config["source_enabled"] = {p: p == provider for p in PROVIDERS}
         config["max_source_requests"] = 2
+        if provider == "cnki":
+            config["source_max_results"] = 1
         config["retries"] = 0
         config["force_refresh"] = True
         calls = []
         async def audit(item):
-            calls.append(service.call(None, None, item, "online"))
+            if item.get("provider") == provider:
+                calls.append(service.call(None, None, item, "online"))
         # Test an official record within this provider's coverage, not whether
         # every provider can discover the same paper (BERT is not in PMLR).
-        fields = ({"url": "https://proceedings.iclr.cc/paper_files/paper/2025/hash/"
+        fields = ({"title": "基于部分酸水解-亲水作用色谱-质谱的黄芪多糖结构表征"} if provider == "cnki" else
+                  {"url": "https://proceedings.iclr.cc/paper_files/paper/2025/hash/"
                           "5503a7c69d48a2f86fc00b3dc09de686-Abstract-Conference.html"} if provider == "iclr" else
+                  {"doi": "10.57967/hf/3240"} if provider == "hf_model" else
+                  {"booktitle": "NeurIPS", "year": "2017", "title": "Attention Is All You Need"} if provider == "neurips" else
+                  {"booktitle": "COLM", "year": "2024", "title": "Fine-grained Hallucination Detection and Editing for Language Models"} if provider == "colm" else
                   {"pmlr": "v139/radford21a"} if provider == "pmlr" else
                   {"url": "https://openreview.net/forum?id=v8L0pN6EOi"} if provider == "openreview" else
                   {"url": "https://openreview.net/forum?id=FPVCb0WMuN"} if provider == "tmlr" else

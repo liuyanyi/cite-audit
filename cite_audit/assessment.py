@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 
 from .fields import AUDIT_BIB_FIELDS, FIELD_RULE_VERSION, audit_items, auxiliary_fields, comparison_fields
+from .journals import issns
 from .knowledge import (
     RULE_VERSION,
     Knowledge,
@@ -12,6 +13,7 @@ from .knowledge import (
     field_normalize,
     identifiers,
     identity_compatible,
+    model_repository_match,
     normalize,
     normalize_id,
 )
@@ -59,11 +61,34 @@ def arxiv_match(fields: dict, candidate: str) -> tuple[bool, str]:
 
 
 def current_match(input_fields: dict, version: dict) -> tuple[bool, str]:
+    if any(c["field"] in {"title", "author", "year", "journal", "booktitle", "pages", "url"} for c in version.get("conflicts", [])):
+        latest = {(s["provider"], s["record_id"]): s for s in version["sources"]}
+        for source in latest.values():
+            valid, reason = current_match(input_fields, {"fields": source["fields"], "identifiers": identifiers(source)})
+            if valid:
+                return True, f"{reason}；依据 {source['provider']} 的独立记录，来源间字段分歧另列"
+        return False, "来源字段存在分歧，单条来源记录不足以确认当前版本"
     input_fields = comparison_fields(input_fields)
     vf, vi = comparison_fields(version["fields"]), version["identifiers"]
+    if not input_fields.get("eprint") and model_repository_match(input_fields, vf):
+        return True, "DOI、模型仓库地址、发布平台和年份一致，资源身份已确认"
+    input_ids = identifiers({"fields": input_fields})
+    url = input_fields.get("url", "").rstrip("/")
+    same_doi = bool(input_ids.get("doi") and input_ids["doi"] == vi.get("doi"))
+    same_url = bool(url and url == vf.get("url", "").rstrip("/") and not input_ids.get("doi"))
+    if (same_doi and not input_ids.get("arxiv") and url and url == vf.get("url", "").rstrip("/")
+            and all(input_fields.get(k) and field_normalize(k, input_fields[k]) == field_normalize(k, vf.get(k))
+                    for k in ("title", "year", "booktitle", "pages"))
+            and (roster := authors(input_fields.get("author", ""))) and roster == authors(vf.get("author", ""))):
+        return True, "DOI、原文链接、题名、年份、会场、页码和有序作者姓氏一致；姓名写法单独核验"
+    if (not input_ids.get("arxiv") and (same_doi or same_url)
+            and input_fields.get("year") and input_fields["year"] == vf.get("year")
+            and author_match(input_fields.get("author", ""), vf.get("author", "")) == "full"
+            and any(input_fields.get(k) and vf.get(k) and venue_normalize(input_fields[k]) == venue_normalize(vf[k])
+                    for k in ("journal", "booktitle"))):
+        return True, "标识、完整有序作者、年份和出版来源一致，版本身份已确认"
     if not identity_compatible(input_fields, vf):
         return False, "Input title/author contradict this publication identifier"
-    input_ids = identifiers({"fields": input_fields})
     if input_ids.get("arxiv"):
         return arxiv_match(input_fields, vi.get("arxiv", ""))
     if input_ids.get("doi") and vi.get("doi") == input_ids["doi"]:
@@ -71,6 +96,10 @@ def current_match(input_fields: dict, version: dict) -> tuple[bool, str]:
     forum = openreview_id(input_fields.get("url", ""))
     if (forum and forum == vi.get("openreview") and not input_ids.get("doi")
             and normalize(input_fields.get("title")) == normalize(vf.get("title"))):
+        for field in ("year", "booktitle", "journal"):
+            if (input_fields.get(field) and vf.get(field)
+                    and field_normalize(field, input_fields[field]) != field_normalize(field, vf[field])):
+                return False, "OpenReview forum 指向的发表记录与输入年份或会场不符"
         return True, "OpenReview forum and accepted publication identity agree"
     # Input identifiers are not truth. When DOI is wrong, a separately retrieved
     # record may still match by the full publication tuple; title alone cannot.
@@ -85,6 +114,14 @@ def current_match(input_fields: dict, version: dict) -> tuple[bool, str]:
             and author_match(input_fields.get("author", ""), vf.get("author", "")) in {"full", "order_variant", "partial"}):
         return True, "ICLR 官方论文集标识、题名、作者、年份与会场相符"
     pages_ok = bool(input_fields.get("pages")) and field_normalize("pages", input_fields["pages"]) == field_normalize("pages", vf.get("pages"))
+    if (vi.get("cnki") and not input_ids and title_ok and pages_ok and venue_ok
+            and input_fields.get("journal") and vf.get("journal")
+            and author_match(input_fields.get("author", ""), vf.get("author", "")) == "full"
+            and set(issns(input_fields.get("issn"))) & set(issns(vf.get("issn")))
+            and all(not input_fields.get(k) or input_fields[k] == vf.get(k)
+                    for k in ("year", "volume", "number"))
+            and input_fields.get("entrytype", "article") == vf.get("entrytype") == "article"):
+        return True, "知网期刊题录的题名、完整有序作者、刊名、ISSN 和页码均与输入一致"
     if title_ok and author_ok and year_ok and (venue_ok or pages_ok):
         return True, "Title, ordered authors, year and publication venue/pages jointly agree"
     missing = [label for valid, label in [(title_ok, "题名"), (author_ok, "完整有序作者"),
@@ -135,6 +172,10 @@ def assess(knowledge: Knowledge, entry: dict, source_records: list[dict], mode: 
     matches = [(v, reason) for v in versions.values() for valid, reason in [current_match(original, v)] if valid]
     failed_calls = [c for c in calls if c.get("status") in {"failed", "rate_limited", "budget_exhausted", "budget_exceeded", "partial"}
                     and c.get("error_code") != "coverage_unavailable"]
+    queried = {c["provider"] for c in calls if c.get("request_count") or c.get("cache_hit")}
+    completed_sources = {c["provider"] for c in calls if c.get("operation") == "result"
+                         and c.get("status") in {"success", "no_result"} and c["provider"] in queried}
+    budget_hit = any(c.get("status") in {"budget_exhausted", "budget_exceeded"} for c in failed_calls)
     current = matches[0][0] if len(matches) == 1 else None
     if current:
         wrong_targets = {field: [s for s in items if versions[s["version_id"]]["article_id"] != current["article_id"]]
@@ -198,16 +239,21 @@ def assess(knowledge: Knowledge, entry: dict, source_records: list[dict], mode: 
         identity_state, reason = "confirmed", matches[0][1]
     elif len(matches) > 1:
         identity_state, reason = "ambiguous", "More than one publication record matches; no automatic replacement"
-    elif failed_calls and not candidates:
-        identity_state, reason = "source_failed", "Source access failed or budget exhausted; existence is not determined"
+    elif failed_calls and not candidates and (budget_hit or not completed_sources):
+        identity_state = "source_failed"
+        reason = "请求预算耗尽，尚未确认文献身份" if budget_hit else "来源访问失败，尚未确认文献身份"
     elif candidates:
         identity_state, reason = "insufficient", "存在相关候选，但出版版本证据不足；不是多个已匹配身份之间的歧义"
     elif any(c.get("provider") == "coverage" and c.get("status") == "unsupported" for c in calls):
         identity_state, reason = "insufficient", "当前来源不支持此文献类型的身份核验（例如专利）；不能据此判断文献不存在"
     elif not original.get("title") and not (original.get("doi") or original.get("eprint")):
         identity_state, reason = "insufficient", "No usable title or identifier in this entry"
+    elif any(c.get("provider") == "discovery" for c in calls) and not any(
+        c.get("request_count") or c.get("cache_hit") for c in calls if c.get("provider") != "knowledge"
+    ):
+        identity_state, reason = "insufficient", "没有适用的已启用来源执行查询，无法核验该条目"
     else:
-        identity_state, reason = "not_found", "No matching record in the checked sources; this does not prove nonexistence"
+        identity_state, reason = "not_found", "已完成查询的来源未找到匹配记录，无法据此判断文献不存在"
     if mode == "demo":
         reason += "; demonstration fixture only, not online verification"
     article = knowledge.article(current["article_id"]) if current else None
@@ -224,6 +270,12 @@ def assess(knowledge: Knowledge, entry: dict, source_records: list[dict], mode: 
             judgment, field_reason = "unverifiable", "同一语义的输入字段相互冲突；请先审阅原值，不自动选择或覆盖"
         elif not metadata["applicable"]:
             judgment, field_reason = "not_applicable", "不适用于当前文献类型；保留输入，不自动补全或改写"
+        elif (field == "title" and current and model_repository_match(original, current["fields"])
+              and selection.get("status") == "conflicting"
+              and len(registered := {r["value"] for r in refs if r.get("source_url", "").startswith("https://api.datacite.org/dois/")}) == 1):
+            after = registered.pop()
+            judgment = "consistent" if field_normalize(field, before) == field_normalize(field, after) else "conflict"
+            field_reason = "按 DOI 登记题名核验；模型卡的推荐引用题名不同，两处来源均予保留"
         elif not current or selection.get("status") == "conflicting":
             judgment = "unverifiable"
             field_reason = ("Current publication is not confirmed" if not current else "Sources conflict within this version")
@@ -239,6 +291,11 @@ def assess(knowledge: Knowledge, entry: dict, source_records: list[dict], mode: 
             judgment, field_reason = "unverifiable", "arXiv 来源的默认 article 不足以确定 Bib 条目类型"
         elif field == "eprint" and current["identifiers"].get("arxiv") and arxiv_match(original, after)[0]:
             judgment, field_reason = "consistent", "arXiv 基础编号及修订相容"
+        elif (field == "url" and openreview_id(before) and openreview_id(after)
+              and openreview_id(before) != openreview_id(after)
+              and any(v["article_id"] == current["article_id"] and v["identifiers"].get("openreview") == openreview_id(before)
+                      for v in versions.values())):
+            judgment, field_reason = "conflict", "原 URL 指向同一论文的另一发表版本；建议改为当前会场的 OpenReview forum"
         elif str(before) == str(after):
             judgment, field_reason = "consistent", "Matches the current publication version"
         elif field_normalize(metadata["comparison_field"], before) == field_normalize(metadata["comparison_field"], after):
@@ -312,7 +369,10 @@ def assess(knowledge: Knowledge, entry: dict, source_records: list[dict], mode: 
         "version_relations": [r for v in article["versions"] for r in v["relations"]] if article else [],
         "proposals": proposals, "sources": list(used_sources.values()), "candidates": candidates,
         "excluded_candidates": excluded, "calls": calls, "journal_checks": journal_checks or [],
-        "warnings": ["Demonstration data — no online verification"] if mode == "demo" else [],
+        "warnings": (["Demonstration data — no online verification"] if mode == "demo" else [])
+                    + ([("请求预算耗尽，发现范围受限。" if budget_hit else
+                         "部分来源未完成查询，发现范围受限：" + "、".join(sorted({c["provider"] for c in failed_calls})))]
+                       if failed_calls and (current or completed_sources or candidates) else []),
         "evidence_revision": {"merge_revision": current["merge_revision"] if current else None,
                               "field_rule_version": FIELD_RULE_VERSION,
                               "recommendation_revision": article["recommendation"]["revision"] if article else None,

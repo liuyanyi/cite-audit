@@ -11,11 +11,13 @@ from pathlib import Path
 from . import presenters
 from .assessment import assess, current_match
 from .bib import parse_bib, preview_export
-from .entry_status import CLASSIFICATION_SQL, SUPPORTED_SQL, classification, summary_expressions, verification_supported
+from .entry_status import CLASSIFICATION_SQL, GROUPS, SUPPORTED_SQL, classification, summary_expressions, verification_supported
+from .fields import required_corrections
 from .events import TaskEvents
 from .journals import issns, journal_matches
 from .knowledge import Knowledge, field_normalize, identifiers
-from .policy import SETTING_LIMITS
+from .matching import author_match, normalize, plain_title
+from .policy import PROVIDERS, SETTING_LIMITS
 from .settings import DEFAULTS, Settings, redact, secrets_from
 from .storage import Store, dump, load, now, uid
 
@@ -40,9 +42,12 @@ class AuditService:
         self.events = TaskEvents(self.store)
         self.settings = Settings(self.store)
         self.knowledge = Knowledge(self.store)
+        from .sources import SourceRegistry
         if registry is None:
-            from .sources import SourceRegistry
             registry = SourceRegistry()
+        if isinstance(registry, SourceRegistry):
+            from .cnki import BrowserSession
+            registry.cnki_browser = BrowserSession(self.store)
         self.registry = registry
         self.worker_task = None
         self.wake = asyncio.Event()
@@ -167,13 +172,14 @@ class AuditService:
             "identity_state": result.get("identity_state", "insufficient"),
             "version_status": result.get("version_status", "unknown"),
             "recommendation_status": result.get("recommendation_status", "unavailable"),
+            "required_corrections": required_corrections(result),
             "has_conflict": result.get("has_conflict", False), "conflict_count": result.get("conflict_count", 0),
             "completion_count": result.get("completion_count", 0), "article_id": result.get("article_id"),
             "current_version_id": result.get("current_version_id"), "recommended_version_id": result.get("recommended_version_id"),
             "mode": mode, "diagnostics": load(row["diagnostics"]),
             "verification_supported": verification_supported(row["entry_type"], fields, result),
         }
-        item["classification"] = classification(item)
+        item["classification"] = classification(item, result.get("calls", []))
         if detail:
             item.update({"original_bib": row["raw_bib"], "fields": fields,
                          "field_assessments": [], "proposals": [], "sources": [], "candidates": [], "calls": [],
@@ -184,6 +190,9 @@ class AuditService:
                          "recommendation": {"status": "unavailable", "reason": "Awaiting audit", "differences": []}})
             if result:
                 item.update(presenters.assessment(result))
+                if item["identity_reason"] == "Source access failed or budget exhausted; existence is not determined":
+                    item["identity_reason"] = ("请求预算耗尽，尚未确认文献身份" if item["classification"] == "budget_exhausted"
+                                               else "来源访问失败，尚未确认文献身份")
         return item
 
     def entries(self, task_id, detail=False):
@@ -204,28 +213,33 @@ class AuditService:
         return result
 
     def entry_page(self, task_id, q="", identity_state="", recommendation_status="", has_conflict=False,
-                   sort="ordinal", page=1, page_size=25, classification=""):
+                   sort="ordinal", page=1, page_size=25, classification="", needs_correction=False, execution_status=""):
         task = self.raw_task(task_id)
         where = ("entries WHERE task_id=? AND instr(casefold(citation_key || ' ' || "
                  "COALESCE(json_extract(input_fields,'$.title'),'Untitled entry') || ' ' || "
                  "COALESCE(json_extract(input_fields,'$.author'),'')),?)>0")
         args = [task_id, q.casefold()]
+        if execution_status:
+            statuses = execution_status.split(",")
+            if not set(statuses) <= {"queued", "running", "completed", "partial", "failed", "cancelled"}:
+                raise ValueError("Unknown entry execution status")
+            where += " AND status IN (" + ",".join("?" for _ in statuses) + ")"
+            args.extend(statuses)
         if identity_state == "unsupported":
             where += f" AND NOT {SUPPORTED_SQL}"
         elif identity_state:
             where += f" AND {SUPPORTED_SQL} AND COALESCE(json_extract(result,'$.identity_state'),'insufficient')"
-            if identity_state == "not_found":
-                where += " IN ('not_found','source_failed')"
-            else:
-                where += "=?"
-                args.append(identity_state)
+            where += "=?"
+            args.append(identity_state)
         if recommendation_status:
             where += " AND COALESCE(json_extract(result,'$.recommendation_status'),'unavailable')=?"
             args.append(recommendation_status)
         if has_conflict:
             where += " AND json_extract(result,'$.has_conflict')=1"
+        if needs_correction:
+            where += " AND needs_correction(result)"
         if classification:
-            if classification not in {"version_confirmed", "wrong_paper", "not_found", "unverifiable"}:
+            if classification not in GROUPS:
                 raise ValueError("Unknown entry classification")
             where += f" AND ({CLASSIFICATION_SQL})=?"
             args.append(classification)
@@ -335,13 +349,16 @@ class AuditService:
             self.freeze(task_id)
         return self.task(task_id)
 
-    def retry(self, task_id):
-        return self._retry(task_id)
+    def retry(self, task_id, **selection):
+        return self._retry(task_id, **selection)
 
     def retry_entry(self, task_id, entry_id):
         return self._retry(task_id, entry_id)
 
-    def _retry(self, task_id, entry_id=None):
+    def retry_unverifiable(self, task_id):
+        return self._retry(task_id, categories=["unverifiable"])
+
+    def _retry(self, task_id, entry_id=None, *, categories=None, entry_ids=None, revision=None, budgets=None):
         # Archive and enqueue atomically so duplicate clicks cannot start another
         # revision or erase the frozen report. Original inputs and IDs stay put.
         with self.store.connect() as db:
@@ -354,12 +371,38 @@ class AuditService:
                 raise KeyError("Entry not found")
             if task["status"] not in TERMINAL or not task["report"]:
                 raise ValueError("请等待当前任务核查结束并生成报告后再重新核查")
-            revision = db.execute("SELECT COALESCE(MAX(revision),0)+1 FROM task_reports WHERE task_id=?",
-                                  (task_id,)).fetchone()[0]
+            current_revision = db.execute("SELECT COALESCE(MAX(revision),0)+1 FROM task_reports WHERE task_id=?",
+                                          (task_id,)).fetchone()[0]
+            if revision is not None and current_revision != revision:
+                raise ValueError("报告已更新，请重新打开对话框选择条目")
+            revision = current_revision
             db.execute("INSERT INTO task_reports VALUES(?,?,?)", (task_id, revision, task["report"]))
-            db.execute("UPDATE entries SET status='queued',result=NULL WHERE task_id=?" + (" AND id=?" if entry_id else ""),
-                       (task_id, entry_id) if entry_id else (task_id,))
+            where = "task_id=?"
+            params = [task_id]
+            if entry_id:
+                where += " AND id=?"
+                params.append(entry_id)
+            if categories is not None:
+                if not categories or set(categories) - set(GROUPS) or entry_ids is not None:
+                    raise ValueError("请选择有效的核查结果分组")
+                where += f" AND ({CLASSIFICATION_SQL}) IN (SELECT value FROM json_each(?))"
+                params.append(dump(categories))
+            if entry_ids is not None:
+                where += " AND id IN (SELECT value FROM json_each(?))"
+                params.append(dump(entry_ids))
+                if not entry_ids or db.execute(f"SELECT count(*) FROM entries WHERE {where}", params).fetchone()[0] != len(set(entry_ids)):
+                    raise ValueError("所选条目为空或不属于当前任务")
+            queued = db.execute(f"UPDATE entries SET status='queued',result=NULL WHERE {where}", params)
+            if not queued.rowcount:
+                raise ValueError("当前选择没有可重新核查的条目")
             config = {**load(task["config"]), "force_refresh": True}
+            for key, limit in (("entry_request_budget", "max_source_requests"), ("request_budget", "max_task_requests")):
+                if budgets and key in budgets:
+                    value = budgets[key]
+                    low, high = SETTING_LIMITS[limit]
+                    if type(value) is not int or not low <= value <= high:
+                        raise ValueError(f"{key} 必须在 {low} 到 {high} 之间")
+                    config[key] = value
             db.execute("UPDATE tasks SET status='queued',cancelled=0,error=NULL,report=NULL,config=?,updated_at=? WHERE id=?",
                        (dump(config), now(), task_id))
         self.wake.set()
@@ -437,6 +480,55 @@ class AuditService:
         return (self.stopping or not task or bool(task["cancelled"])
                 or (revision is not None and revision != self.report_revision(task_id)))
 
+    def local_crossref_source(self, fields):
+        from .sources import normalize_doi
+        doi = normalize_doi(fields.get("doi", ""))
+        if not doi:
+            return None
+        row = self.store.one(
+            "SELECT id FROM sources WHERE namespace='online' AND provider='crossref' "
+            "AND record_id=? AND status='confirmed' ORDER BY created_at DESC LIMIT 1", (doi,))
+        if row:
+            source = self.knowledge.source(row["id"])
+            if (source.get("source_type") == "registry" and source.get("status") == "verified"
+                    and source["fields"].get("entrytype") in {"article", "inproceedings", "incollection"}
+                    and current_match(fields, source)[0]):
+                return source
+        return None
+
+    def conference_index(self, enabled):
+        providers = [p for p in ("acl", "pmlr", "iclr", "neurips", "colm") if enabled.get(p, True)]
+        index = {}
+        for row in self.store.all(
+            "SELECT id,provider,record_id,version_id,json_extract(data,'$.fields') AS fields FROM sources "
+            "WHERE namespace='online' AND status='confirmed' AND json_extract(data,'$.source_type')='official' "
+            "AND provider IN (SELECT value FROM json_each(?)) ORDER BY created_at DESC", (dump(providers),)):
+            fields = load(row["fields"])
+            title = normalize(plain_title(fields.get("title", "")))
+            if title:
+                row["fields"] = fields
+                index.setdefault(title, []).append(row)
+        return index
+
+    def conference_hits(self, index, fields):
+        if fields.get("eprint") or fields.get("journal"):
+            return []
+        hits = {}
+        for row in index.get(normalize(plain_title(fields.get("title", ""))), []):
+            other = row["fields"]
+            if any(fields.get(k) and other.get(k) and field_normalize(k, fields[k]) != field_normalize(k, other[k])
+                   for k in ("doi", "booktitle", "year", "url")):
+                continue
+            same_id = any(fields.get(k) and field_normalize(k, fields[k]) == field_normalize(k, other.get(k))
+                          for k in ("doi", "url"))
+            same_venue = all(fields.get(k) and field_normalize(k, fields[k]) == field_normalize(k, other.get(k))
+                             for k in ("booktitle", "year"))
+            if (same_id or same_venue) and author_match(fields.get("author", ""), other.get("author", "")) == "full":
+                hits.setdefault((row["provider"], row["record_id"]), row)
+        if len({row["version_id"] for row in hits.values()}) != 1:
+            return []
+        return [self.knowledge.source(row["id"]) for row in hits.values()]
+
     def reusable_sources(self, fields, mode, ttl):
         wanted = identifiers({"fields": fields})
         if not wanted:
@@ -496,7 +588,58 @@ class AuditService:
         overrides = load(task["config"])
         config.update({"request_timeout_seconds": overrides["timeout_seconds"], "retries": overrides["max_retries"],
                        "force_refresh": overrides.get("force_refresh", False)})
-        for row in self.store.all("SELECT * FROM entries WHERE task_id=? AND status='queued' ORDER BY ordinal", (task_id,)):
+        rows = self.store.all("SELECT * FROM entries WHERE task_id=? AND status='queued' ORDER BY ordinal", (task_id,))
+        conference_index = (self.conference_index(config.get("source_enabled", {}))
+                            if task["mode"] == "online" and not config.get("force_refresh") else {})
+        local_arxiv = {}
+        if task["mode"] == "online" and config.get("source_enabled", {}).get("arxiv", True):
+            from .sources import arxiv_identifier
+            ids = []
+            for row in rows:
+                if row["entry_type"] == "patent" or any(d.get("severity") == "error" for d in load(row["diagnostics"])):
+                    continue
+                fields = load(row["input_fields"])
+                if fields.get("edition", "").upper().startswith("CN"):
+                    continue
+                if identifier := arxiv_identifier(fields):
+                    ids.append(identifier)
+            ids = list(dict.fromkeys(ids))
+            if not config.get("force_refresh"):
+                for identifier in ids:
+                    source = self.knowledge.local_arxiv_source(identifier, config["knowledge_ttl_seconds"])
+                    if source:
+                        local_arxiv[identifier] = source
+            config["arxiv_batch_ids"] = [key for key in ids if key not in local_arxiv]
+            config["arxiv_batch_results"] = {}
+        from .policy import cnki_search_title, cnki_title_eligible
+        cnki_by_entry = {}
+        if (task["mode"] == "online" and config.get("source_enabled", {}).get("cnki")
+                and hasattr(self.registry, "cnki_task")):
+            titles = {}
+            for row in rows:
+                fields = load(row["input_fields"])
+                title = cnki_search_title(fields.get("title", ""))
+                if (cnki_title_eligible(title) and row["entry_type"] != "patent" and not fields.get("edition", "").upper().startswith("CN")
+                        and not any(d.get("severity") == "error" for d in load(row["diagnostics"]))):
+                    titles.setdefault(title, []).append(row["id"])
+
+            async def batch_audit(entry_id, item):
+                return self.call(task_id, entry_id, item, "online", revision=revision)
+
+            if titles:
+                batches = await self.registry.cnki_task(
+                    titles, config, batch_audit,
+                    lambda entry: self.remaining_requests(task_id, entry, revision, overrides),
+                    lambda: self.is_cancelled(task_id, revision))
+                for title, entries in titles.items():
+                    for entry in entries:
+                        cnki_by_entry[entry] = batches.get(title, [])
+                        if entry != entries[0]:
+                            await batch_audit(entry, {"provider": "cnki", "operation": "复用同题名任务检索",
+                                                     "status": "success" if title in batches else "partial",
+                                                     "record_count": len(cnki_by_entry[entry])})
+            config["source_enabled"] = {**config["source_enabled"], "cnki": False}
+        for row in rows:
             if self.is_cancelled(task_id, revision):
                 break
             self.store.execute("UPDATE entries SET status='running' WHERE id=?", (row["id"],))
@@ -514,24 +657,57 @@ class AuditService:
                     status = "failed"
                 else:
                     existing = [] if config.get("force_refresh") else self.reusable_sources(fields, task["mode"], config["knowledge_ttl_seconds"])
+                    local_source = local_arxiv.get(arxiv_identifier(fields)) if local_arxiv else None
+                    local_sources = self.conference_hits(conference_index, fields) if conference_index else []
+                    if local_source:
+                        local_sources.append(local_source)
+                    if (task["mode"] == "online" and not config.get("force_refresh")
+                            and config.get("source_enabled", {}).get("crossref", True)):
+                        crossref = self.local_crossref_source(fields)
+                        if crossref:
+                            local_sources.append(crossref)
+                    existing = list({s["id"]: s for s in [*existing, *local_sources]}.values())
+                    for local_source in local_sources:
+                        await audit({"provider": local_source["provider"], "operation": "lookup", "status": "success",
+                                     "cache_hit": True, "fetched_at": local_source["fetched_at"],
+                                     "message": f"复用本地官方快照 {local_source['record_id']}",
+                                     "response_summary": {"snapshot_id": local_source["snapshot_id"]}})
                     if existing:
-                        await audit({"provider": "knowledge", "operation": "reuse", "status": "success", "cache_hit": True})
-                        sources = existing
-                    else:
+                        await audit({"provider": "knowledge", "operation": "reuse", "status": "success", "cache_hit": True,
+                                     "message": "复用已有版本证据。" + ("继续在线发现其他记录。" if task["mode"] == "online" else "")})
+                    sources = existing
+                    if not existing or task["mode"] == "online":
                         remaining = self.remaining_requests(task_id, row["id"], revision, overrides)
                         if remaining <= 0:
                             await audit({"provider": "budget", "operation": "lookup", "status": "budget_exhausted",
                                          "message": "Entry or task request budget exhausted"})
-                            records = []
-                        else:
-                            lookup_config = {**config, "max_source_requests": remaining}
+                        lookup_config = {**config, "max_source_requests": max(0, remaining)}
+                        if remaining <= 0 and config.get("arxiv_batch_results"):
+                            lookup_config["source_enabled"] = {p: p == "arxiv" for p in PROVIDERS}
+                        if local_sources:
+                            lookup_config["source_enabled"] = {**lookup_config.get("source_enabled", {}),
+                                                               **{s["provider"]: False for s in local_sources}}
+                        records = cnki_by_entry.get(row["id"], [])
+                        lookup_config["task_cnki_records"] = records
+                        if remaining > 0 or (config.get("arxiv_batch_results")
+                                             and arxiv_identifier(fields) in config["arxiv_batch_results"]):
                             records = await self.registry.lookup(
                                 {**fields, "entrytype": row["entry_type"]},
                                 "mock" if task["mode"] == "demo" else "online", lookup_config,
                                 audit=audit, cancelled=lambda: self.is_cancelled(task_id, revision))
                         if self.is_cancelled(task_id, revision):
                             break
-                        sources = self.knowledge.ingest(records, "mock" if task["mode"] == "demo" else "online")
+                        ingestion = asyncio.create_task(asyncio.to_thread(
+                            self.knowledge.ingest, records, "mock" if task["mode"] == "demo" else "online"))
+                        try:
+                            discovered = await asyncio.shield(ingestion)
+                            sources = list({s["id"]: s for s in [*existing, *discovered]}.values())
+                        except asyncio.CancelledError:
+                            # Finish this batch before the worker shuts down.
+                            await ingestion
+                            raise
+                        if self.is_cancelled(task_id, revision):
+                            break
                     calls = self.calls(task_id, row["id"], revision=revision)
                     result = assess(self.knowledge, entry_input, sources, task["mode"], calls)
                     journal = next((a for a in result["field_assessments"]

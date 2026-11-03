@@ -129,3 +129,40 @@ def test_report_routes_and_retries_never_create_tasks(tmp_path):
         assert client.get(f'/api/tasks/{tid}/reports/0').status_code == 404
         service.cancel(tid)
         assert len(client.get(f'/api/tasks/{tid}/reports').json()['items']) == 2
+
+
+def test_batch_retry_uses_unverifiable_filter_and_freezes_previous_report(tmp_path):
+    with TestClient(create_app(tmp_path, start_worker=False)) as client:
+        service = client.app.state.service
+        raw = b'@patent{p,title={Patent}}\n@misc{other,title={Unrelated reference}}'
+        tid = service.create_task(raw, 'mixed.bib', '', 'demo')['id']
+        asyncio.run(service.run_task(tid))
+        base = f'/api/tasks/{tid}'
+        old = client.get(base + '/report').json()
+        selected = client.get(base + '/entries?classification=unverifiable').json()['items']
+        assert [e['citation_key'] for e in selected] == ['p']
+        response = client.post(base + '/retry-unverifiable')
+        assert response.status_code == 200
+        assert client.post(base + '/retry-unverifiable').status_code == 400
+        assert [e['citation_key'] for e in service.entries(tid) if e['execution_status'] == 'queued'] == ['p']
+        asyncio.run(service.run_task(tid))
+        assert service.report_revision(tid) == 2
+        assert client.get(base + '/reports/1').json() == old
+
+def test_retry_selection_is_revision_bound_and_atomic(tmp_path):
+    with TestClient(create_app(tmp_path, start_worker=False)) as client:
+        service = client.app.state.service
+        tid = service.create_task(b'@patent{x,title={Patent}}\n@misc{y,title={Unknown work}}', 'refs.bib', '', 'demo')['id']
+        asyncio.run(service.run_task(tid))
+        route = f'/api/tasks/{tid}/retry'
+        x, y = service.entries(tid)
+        base = {'scope': 'categories', 'revision': 1, 'categories': ['not_found', 'source_failed']}
+        assert client.post(route, json={**base, 'revision': 2}).status_code == 400
+        assert client.post(route, json={'scope': 'entries', 'revision': 1, 'entry_ids': [x['id'], 'foreign']}).status_code == 400
+        assert client.post(route, json={**base, 'entry_request_budget': 0}).status_code == 400
+        assert service.task(tid)['finalized'] and service.report_revision(tid) == 1
+        assert client.post(route, json={**base, 'entry_request_budget': 5}).json()['config']['entry_request_budget'] == 5
+        assert [e['id'] for e in service.entries(tid) if e['execution_status'] == 'queued'] == [y['id']]
+        asyncio.run(service.run_task(tid))
+        assert client.post(route, json={'scope': 'entries', 'revision': 2, 'entry_ids': [x['id']]}).status_code == 200
+        assert [e['id'] for e in service.entries(tid) if e['execution_status'] == 'queued'] == [x['id']]

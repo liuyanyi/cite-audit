@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+
 import threading
 import uuid
 from contextlib import contextmanager
@@ -13,6 +14,7 @@ from pathlib import Path
 
 
 from .entry_status import summary_expressions
+from .fields import required_corrections
 
 
 def now() -> str:
@@ -95,6 +97,10 @@ CREATE TABLE IF NOT EXISTS relations(
  source_id TEXT NOT NULL REFERENCES sources(id), evidence_url TEXT NOT NULL,
  UNIQUE(from_version_id,to_version_id,relation,source_id)
 );
+CREATE TABLE IF NOT EXISTS cnki_query_cache(
+ title TEXT NOT NULL, candidate_limit INTEGER NOT NULL, saved_at REAL NOT NULL, records TEXT NOT NULL,
+ PRIMARY KEY(title, candidate_limit)
+);
 CREATE TABLE IF NOT EXISTS calls(
  id TEXT PRIMARY KEY, task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
  entry_id TEXT, created_at TEXT NOT NULL, data TEXT NOT NULL
@@ -137,8 +143,14 @@ CREATE TRIGGER IF NOT EXISTS call_created AFTER INSERT ON calls WHEN NEW.task_id
 def install_task_counts(db):
     # Install and backfill together so an interrupted initialization is retryable.
     db.execute("BEGIN IMMEDIATE")
-    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_counts'").fetchone():
+    existing = {row[1] for row in db.execute("PRAGMA table_info(task_counts)")}
+    if "budget_exhausted" in existing:
         return
+    if existing:
+        for name in ("insert", "delete", "before_update", "after_update"):
+            db.execute(f"DROP TRIGGER IF EXISTS counts_{name}")
+        db.execute("DROP VIEW entry_counts")
+        db.execute("DROP TABLE task_counts")
     fields = summary_expressions()
     columns = ",".join(fields)
     definitions = ",".join(f"{key} INTEGER NOT NULL" for key in fields)
@@ -182,6 +194,8 @@ class Store:
             db = sqlite3.connect(self.path, timeout=30)
             db.row_factory = sqlite3.Row
             db.create_function("casefold", 1, lambda value: (value or "").casefold(), deterministic=True)
+            db.create_function("needs_correction", 1, lambda result: bool(required_corrections(load(result, {}))),
+                               deterministic=True)
             db.create_function("regexp", 2, lambda pattern, value: bool(re.search(pattern, value or "")),
                                deterministic=True)
             db.execute("PRAGMA foreign_keys=ON")

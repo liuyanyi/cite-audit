@@ -21,6 +21,11 @@ dev = ["httpx>=0.28,<1", "pytest>=8.3,<10", "pytest-asyncio>=0.25,<2", "ruff>=0.
 [project.scripts]
 cite-audit = "cite_audit.cli:main"
 
+[project.optional-dependencies]
+cnki = [
+    "playwright>=1.64.1",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["cite_audit"]
 

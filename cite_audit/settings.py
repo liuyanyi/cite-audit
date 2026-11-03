@@ -18,7 +18,7 @@ from .policy import (
 from .storage import Store, dump, load
 
 DEFAULTS = {
-    "source_enabled": {p: True for p in PROVIDERS},
+    "source_enabled": {p: p != "cnki" for p in PROVIDERS},
     "request_timeout_seconds": 12, "retries": 1, "max_source_requests": 18,
     "max_task_requests": 180, "source_cache_ttl_seconds": 3600,
     "source_max_results": 3, "knowledge_ttl_seconds": 86400,
