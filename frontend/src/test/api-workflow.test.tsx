@@ -157,6 +157,12 @@ it('searches knowledge, pages summaries and opens version evidence through the r
   expect(await screen.findByRole('button', { name: /^BERT: Pre-training/ })).toBeVisible();
 }, 15000);
 
+async function chooseFilter(user: ReturnType<typeof userEvent.setup>, group: string, option: string) {
+  await user.click(await screen.findByRole('button', { name: new RegExp('^' + group) }));
+  await user.click(await screen.findByRole('menuitemcheckbox', { name: option }));
+  await user.keyboard('{Escape}');
+}
+
 it('uses API categories for the leading status, filters and the five task metrics', async () => {
   const raw = '@misc{found,title={BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding},author={Devlin, Jacob and Chang, Ming-Wei and Lee, Kenton and Toutanova, Kristina},year={2018},eprint={1810.04805}}\n@article{missing,title={Synthetic unmatched reference},journal={Input Journal}}\n@patent{patent,title={Synthetic patent}}';
   const boundary = 'classification-ui';
@@ -184,50 +190,28 @@ it('uses API categories for the leading status, filters and the five task metric
   ]);
   expect(Array.from(document.querySelectorAll('.task-metric-value')).map(node => node.textContent)).toEqual(['3', '3100%', '1', '1', '0']);
   const user = userEvent.setup();
-  expect(screen.queryByRole('combobox', { name: '类型筛选' })).not.toBeInTheDocument();
   const filters = within(screen.getByRole('toolbar', { name: '条目筛选' }));
-  const types = within(filters.getByRole('group', { name: '类型筛选' }));
-  expect(types.getAllByRole('button')).toHaveLength(4);
-  expect(types.getByRole('button', { name: '全部' })).toHaveAttribute('aria-pressed', 'true');
-  expect(types.queryByRole('button', { name: '字段冲突' })).not.toBeInTheDocument();
-  const unavailable = filters.getByRole('button', { name: '无法核验' });
-  const confirmed = filters.getByRole('button', { name: '版本已确认' });
-  const conflicts = filters.getByRole('button', { name: '字段冲突' });
-  await user.click(unavailable);
-  await waitFor(() => expect(within(screen.getByRole('table', { name: '本次文件引用核查结果' })).getAllByRole('row')).toHaveLength(2));
-  expect(unavailable).toHaveAttribute('aria-pressed', 'true');
-  expect(types.getByRole('button', { name: '全部' })).toHaveAttribute('aria-pressed', 'false');
-  await user.click(unavailable);
-  await waitFor(() => expect(within(screen.getByRole('table', { name: '本次文件引用核查结果' })).getAllByRole('row')).toHaveLength(4));
-  expect(unavailable).toHaveAttribute('aria-pressed', 'false');
-  expect(types.getByRole('button', { name: '全部' })).toHaveAttribute('aria-pressed', 'true');
-  await user.click(confirmed);
-  fireEvent.change(filters.getByRole('textbox', { name: '搜索条目' }), { target: { value: 'unsubmitted draft' } });
-  await user.click(filters.getByRole('button', { name: '重置' }));
-  expect(filters.getByRole('textbox', { name: '搜索条目' })).toHaveValue('');
-  await new Promise(done => setTimeout(done, 350));
-  await waitFor(() => expect(within(screen.getByRole('table', { name: '本次文件引用核查结果' })).getAllByRole('row')).toHaveLength(4));
-  expect(types.getByRole('button', { name: '全部' })).toHaveAttribute('aria-pressed', 'true');
-  await user.click(confirmed);
-  await waitFor(() => expect(within(screen.getByRole('table', { name: '本次文件引用核查结果' })).getAllByRole('row')).toHaveLength(2));
-  await user.click(conflicts);
-  expect(confirmed).toHaveAttribute('aria-pressed', 'true');
-  expect(conflicts).toHaveAttribute('aria-pressed', 'true');
-  await user.click(unavailable);
+  await chooseFilter(user, '核验进度', '排队中');
+  expect(await screen.findByText('当前没有排队中的条目')).toBeVisible();
+  await chooseFilter(user, '核验进度', '核验中');
+  expect(filters.getByRole('button', { name: /核验进度：排队中：核验中/ })).toBeVisible();
+  await user.click(filters.getByRole('button', { name: '清除筛选' }));
+  await chooseFilter(user, '字段与版本', '关键字段须修改');
   expect(await screen.findByRole('heading', { name: '没有匹配的条目' })).toBeVisible();
-  expect(confirmed).toHaveAttribute('aria-pressed', 'false');
-  expect(unavailable).toHaveAttribute('aria-pressed', 'true');
-  expect(conflicts).toHaveAttribute('aria-pressed', 'true');
-  await user.click(conflicts);
-  await waitFor(() => expect(within(screen.getByRole('table', { name: '本次文件引用核查结果' })).getAllByRole('row')).toHaveLength(2));
-  const filteredTable = screen.getByRole('table', { name: '本次文件引用核查结果' });
+  await chooseFilter(user, '字段与版本', '字段冲突');
+  await screen.findByText('匹配 1 / 3 条');
+  await chooseFilter(user, '核验结论', '不支持核验');
+  expect(await screen.findByRole('heading', { name: '没有匹配的条目' })).toBeVisible();
+  await chooseFilter(user, '字段与版本', '不限字段');
+  await screen.findByText('匹配 1 / 3 条');
+  const filteredTable = await screen.findByRole('table', { name: '本次文件引用核查结果' });
   expect(within(filteredTable).getByText('Synthetic patent')).toBeVisible();
   expect(within(filteredTable).queryByText('版本已确认')).not.toBeInTheDocument();
   await user.click(within(filteredTable).getByRole('link', { name: 'Synthetic patent' }));
   const back = await screen.findByRole('link', { name: '返回任务' });
   const target = new URL(back.getAttribute('href')!, base);
   expect(target.pathname).toBe(`/tasks/${task.id}`);
-  expect(target.searchParams.get('classification')).toBe('unverifiable');
+  expect(target.searchParams.get('classification')).toBe('unsupported');
   expect(target.searchParams.get('page')).toBe('1');
   expect(target.searchParams.has('conflict')).toBe(false);
 }, 20000);
@@ -241,14 +225,12 @@ it('filters upgrades through the API and preserves filters across detail paginat
   connect();
   render(<MemoryRouter initialEntries={[`/tasks/${task.id}?page=2`]}><App /></MemoryRouter>);
   const user = userEvent.setup();
-  const upgrade = await screen.findByRole('button', { name: '找到新版本' });
-  await user.click(upgrade);
-  expect(upgrade).toHaveAttribute('aria-pressed', 'true');
+  await chooseFilter(user, '字段与版本', '找到新版本');
   await screen.findByText('共 11 条');
   expect(screen.getByText('第 1 / 2 页')).toBeVisible();
-  await user.click(screen.getByRole('button', { name: '版本已确认' }));
+  await chooseFilter(user, '核验结论', '版本已确认');
   await screen.findByText('共 11 条');
-  await user.click(screen.getByRole('button', { name: '字段冲突' }));
+  await chooseFilter(user, '字段与版本', '字段冲突');
   await user.click(await screen.findByRole('button', { name: '下一页' }));
   await screen.findByText('第 2 / 2 页');
   await waitFor(() => expect(screen.getAllByRole('link', { name: /^BERT: Pre-training/ })).toHaveLength(1));
@@ -266,9 +248,9 @@ it('filters upgrades through the API and preserves filters across detail paginat
   await user.click(back);
   fireEvent.change(await screen.findByRole('textbox', { name: '搜索条目' }), { target: { value: 'missing' } });
   expect(await screen.findByRole('heading', { name: '没有匹配的条目' })).toBeVisible();
-  await user.click(screen.getByRole('button', { name: '重置' }));
+  await user.click(within(screen.getByRole('toolbar', { name: '条目筛选' })).getByRole('button', { name: '清除筛选' }));
   await screen.findByText('共 12 条');
-  expect(screen.getByRole('button', { name: '找到新版本' })).toHaveAttribute('aria-pressed', 'false');
+  expect(screen.getByRole('button', { name: '字段与版本' })).toBeVisible();
   expect(screen.getByRole('textbox', { name: '搜索条目' })).toHaveValue('');
 }, 30000);
 
@@ -479,12 +461,14 @@ it('separates semantic assessments and untouched auxiliary fields from a real AP
   await userEvent.click(await screen.findByRole('tab', { name: '原件信息' }));
   expect(await screen.findByRole('button', { name: '下载第 1 次核查报告' })).toBeVisible();
   expect(screen.getByRole('button', { name: '下载第 2 次核查报告' })).toBeVisible();
-  await userEvent.click(screen.getByRole('button', { name: '重新核查当前任务' }));
+  await userEvent.click(screen.getByRole('button', { name: '重跑设置…' }));
+    await userEvent.click(screen.getByRole('tab', { name: '全部条目' }));
+    await userEvent.click(screen.getByRole('button', { name: /^开始重跑 \d+ 条$/ }));
   await waitFor(async () => {
     const current = await (await nativeFetch(`${base}/api/tasks/${task.id}`)).json() as Task;
     expect(current.report_revision).toBe(3);
     expect(current.finalized).toBe(true);
-    expect(screen.getByRole('button', { name: '重新核查当前任务' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '重跑设置…' })).toBeEnabled();
     expect(screen.getByRole('button', { name: '下载第 3 次核查报告' })).toBeVisible();
   }, { timeout: 10000 });
   const sameTask = await (await nativeFetch(`${base}/api/tasks?q=semantic.bib`)).json();

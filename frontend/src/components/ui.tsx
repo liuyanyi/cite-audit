@@ -39,6 +39,21 @@ export function Select({ value, onValueChange, options, className = '', id, disa
     </SelectPrimitive.Content></SelectPrimitive.Portal>
   </SelectPrimitive.Root>;
 }
+export function FilterMenu({ label, selected, items }: {
+  label: string; selected: string[]; items: { label: string; checked: boolean; select: () => void }[];
+}) {
+  const summary = selected.slice(0, 2).join('、') + (selected.length > 2 ? ' +' + (selected.length - 2) : '');
+  return <DropdownPrimitive.Root><DropdownPrimitive.Trigger asChild>
+    <Button className={summary ? 'selected-filter' : ''} aria-label={[label, ...selected].join('：')}>{summary || label}<ChevronDown size={14} /></Button>
+  </DropdownPrimitive.Trigger><DropdownPrimitive.Portal>
+    <DropdownPrimitive.Content className="dropdown-content" align="start" sideOffset={5} collisionPadding={8}>
+      {items.map(item => <DropdownPrimitive.CheckboxItem key={item.label} className="dropdown-item" checked={item.checked}
+        onSelect={event => event.preventDefault()} onCheckedChange={item.select}>
+        <span style={{ width: 14 }}><DropdownPrimitive.ItemIndicator><Check size={14} /></DropdownPrimitive.ItemIndicator></span>{item.label}
+      </DropdownPrimitive.CheckboxItem>)}
+    </DropdownPrimitive.Content>
+  </DropdownPrimitive.Portal></DropdownPrimitive.Root>;
+}
 export function ActionMenu({ label, items }: { label: string; items: { label: string; onSelect: () => void; icon?: ReactNode; destructive?: boolean; disabled?: boolean }[] }) {
   return <DropdownPrimitive.Root><DropdownPrimitive.Trigger asChild><Button className="icon-button compact" variant="ghost" aria-label={label}><MoreHorizontal size={18} /></Button></DropdownPrimitive.Trigger>
     <DropdownPrimitive.Portal><DropdownPrimitive.Content className="dropdown-content" align="end" sideOffset={5} collisionPadding={12}>{items.map((item, i) => <DropdownPrimitive.Item key={i} disabled={item.disabled} onSelect={item.onSelect} className={`dropdown-item ${item.destructive ? 'destructive' : ''}`}>{item.icon}{item.label}</DropdownPrimitive.Item>)}</DropdownPrimitive.Content></DropdownPrimitive.Portal>

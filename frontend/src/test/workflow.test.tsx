@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import App from '../App';
@@ -7,6 +7,7 @@ import { settingsFixture } from './fixtures';
 import { ClassificationBadge, FactBadge, costText, safeExternal } from '../format';
 import { request } from '../api';
 import { SourceCard } from '../components/EvidencePanel';
+import RetryDialog from '../components/RetryDialog';
 import { ToastProvider } from '../components/ui';
 import type { EntryDetail, SourceContent, Task } from '../types';
 const summary = { total: 1, completed: 1, running: 0, queued: 0, failed: 0, cancelled: 0, parse_errors: 0, confirmed: 1, conflicts: 0, unresolved: 0, upgrade_available: 1, completion_available: 0, problem_entries: 0, version_confirmed: 1, not_found: 0, unverifiable: 0, unprocessed: 0 };
@@ -20,6 +21,22 @@ beforeEach(() => { localStorage.clear(); fetchMock = vi.fn(async (url: string, o
 afterEach(() => vi.unstubAllGlobals());
 const mount = (path = '/tasks') => render(<MemoryRouter initialEntries={[path]}><App /></MemoryRouter>);
 describe('navigation and truth states', () => {
+  it('retains manual retry selections across pages', async () => {
+    fetchMock.mockImplementation(async url => {
+      if (url.endsWith('/retry')) return reply(task);
+      const second = new URL(url, 'http://localhost').searchParams.get('page') === '2';
+      return reply({ ...page([{ ...entry, id: second ? 'e2' : 'e1', title: second ? 'Second paper' : 'First paper' }]), total: 11 });
+    });
+    render(<RetryDialog task={task} classification="" onClose={() => {}} onStarted={() => {}} />);
+    const dialog = within(screen.getByRole('dialog'));
+    await userEvent.click(dialog.getByRole('tab', { name: '手动选择条目' }));
+    await userEvent.click(await dialog.findByRole('checkbox', { name: /First paper/ }));
+    await userEvent.click(dialog.getByRole('button', { name: '下一页' }));
+    await userEvent.click(await dialog.findByRole('checkbox', { name: /Second paper/ }));
+    await userEvent.click(dialog.getByRole('button', { name: '开始重跑 2 条' }));
+    const call = fetchMock.mock.calls.find(([url]) => url.endsWith('/retry'));
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ scope: 'entries', revision: 1, entry_ids: ['e1', 'e2'] });
+  });
   it('renders readable journal text while preserving original Bib and copy values', async () => {
     const original = fetchMock.getMockImplementation()!;
     const journal = 'Theory \\&; Applications';
@@ -62,7 +79,9 @@ describe('safe actions', () => {
   it('retries within the current task and keeps the current route', async () => {
     const original = fetchMock.getMockImplementation()!;
     fetchMock.mockImplementation(async (url: string, opts?: RequestInit) => { if (url === '/api/tasks/t1') return reply({ ...task, execution_status: 'failed' }); if (url.endsWith('/retry')) return reply({ ...task, execution_status: 'queued' }); return original(url, opts); });
-    mount('/tasks/t1'); await userEvent.click(await screen.findByRole('button', { name: '重新核查当前任务' }));
+    mount('/tasks/t1'); await userEvent.click(await screen.findByRole('button', { name: '重跑设置…' }));
+    await userEvent.click(screen.getByRole('tab', { name: '全部条目' }));
+    await userEvent.click(screen.getByRole('button', { name: /^开始重跑 \d+ 条$/ }));
     expect(screen.getByRole('heading', { name: '论文引用' })).toBeVisible();
     expect(await screen.findByText('已在当前任务中重新核查，历史报告已保留。')).toBeVisible();
     expect(fetchMock.mock.calls.filter(c => c[0].endsWith('/retry'))).toHaveLength(1);
@@ -104,8 +123,8 @@ describe('API and formatting', () => {
   it('retains the original red unmatched display for source failures in both result and type badges', () => {
     const failed = { ...entry, identity_state: 'source_failed' as const, version_status: 'unknown', has_conflict: false, classification: 'unverifiable' as const };
     render(<><FactBadge entry={failed} /><ClassificationBadge entry={failed} /></>);
-    expect(screen.getAllByText('未找到匹配')).toHaveLength(2);
-    screen.getAllByText('未找到匹配').forEach(badge => expect(badge).toHaveClass('danger'));
+    expect(screen.getAllByText('来源访问失败')).toHaveLength(2);
+    expect(screen.queryByText('未找到匹配')).not.toBeInTheDocument();
     expect(screen.queryByText('无法核验')).not.toBeInTheDocument();
   });
   it('keeps unknown cost distinct from zero', () => { expect(costText({ known: false, amount: 0, currency: 'USD' })).toBe('未知'); expect(costText({ known: true, amount: 0, currency: 'USD' })).toBe('USD 0.00000'); });

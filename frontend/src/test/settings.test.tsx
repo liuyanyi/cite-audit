@@ -34,9 +34,11 @@ describe('settings configuration and confirmations', () => {
       expect(within(row).getByRole('rowheader')).toHaveTextContent(name);
       const lastCell = within(row).getAllByRole('cell').at(-1)!;
       const actions = within(lastCell).getAllByRole('button');
-      expect(actions.at(-1)).toHaveAccessibleName(`配置 ${name}`);
+      expect(actions.at(-2)).toHaveAccessibleName(`配置 ${name}`);
+      expect(actions.at(-1)).toHaveAccessibleName(`说明 ${name}`);
       await user.click(actions.at(-1)!);
-      expect(screen.getByRole('dialog')).toHaveAccessibleName(`配置 ${name}`);
+      expect(screen.getByRole('dialog')).toHaveAccessibleName(`${name}说明`);
+      expect(screen.getByRole('dialog')).toHaveTextContent('DOI');
       await user.keyboard('{Escape}');
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
       await waitFor(() => expect(actions.at(-1)).toHaveFocus());

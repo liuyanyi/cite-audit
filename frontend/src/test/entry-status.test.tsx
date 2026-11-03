@@ -27,6 +27,12 @@ it('keeps conflicts primary and also exposes the upgrade', () => {
   expect(screen.getByText('存在字段冲突').closest('td')).toHaveClass('entry-status-warning');
   expect(screen.getByText('找到新版本')).toHaveClass('entry-upgrade-note');
 });
+it('names required corrections and preserves an independent upgrade', () => {
+  show({ has_conflict: true, required_corrections: ['year'] });
+  expect(screen.getByText('关键字段须修改').closest('td')).toHaveClass('entry-status-danger');
+  expect(screen.getByText('year')).toBeVisible();
+  expect(screen.getByText('找到新版本')).toBeVisible();
+});
 it('shows a wrong-paper identifier as a red entry error before field conflicts', () => {
   show({ identity_state: 'wrong_paper', has_conflict: true });
   expect(screen.getByText('论文错误').closest('td')).toHaveClass('entry-status-danger');
