@@ -48,3 +48,28 @@ code,pre,.mono{font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace
 .segmented-control>.button{border:1px solid transparent;background:transparent;box-shadow:none;color:var(--muted);padding:5px 9px;min-height:28px;white-space:nowrap}
 .segmented-control>.button:hover{color:var(--text)}
 .segmented-control>.button[aria-pressed=true]{background:var(--surface);border-color:var(--border);color:var(--text);box-shadow:0 1px 2px #0001}
+
+.modal:has(> .help-tabs) {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: min(680px, 90dvh);
+  overflow: hidden;
+}
+.help-tabs {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  padding-top: 16px;
+  --help-inset: clamp(16px, 4vw, 24px);
+}
+.help-tabs > .tabs {
+  margin-inline: var(--help-inset);
+  max-width: calc(100% - 2 * var(--help-inset));
+}
+.help-tabs > [role="tabpanel"]:not([hidden]) {
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  align-content: start;
+  padding: 16px var(--help-inset) 24px;
+}
+.help-tabs > [hidden] { display: none; }
