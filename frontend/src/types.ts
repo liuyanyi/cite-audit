@@ -1,0 +1,41 @@
+export type Mode = 'demo' | 'online';
+export type Execution = 'queued' | 'running' | 'completed' | 'partial' | 'failed' | 'cancelled';
+export type Identity = 'wrong_paper' | 'confirmed' | 'ambiguous' | 'not_found' | 'insufficient' | 'source_failed';
+export type EntryClassification = 'wrong_paper' | 'version_confirmed' | 'not_found' | 'unverifiable' | 'source_failed' | 'budget_exhausted';
+export type RecommendationState = 'same_version' | 'upgrade_available' | 'unavailable' | 'ambiguous';
+export interface Page<T> { items: T[]; total: number; page: number; page_size: number; active_tasks?: number }
+export interface Cost { amount: number | null; currency: string | null; known: boolean; price_snapshot?: unknown }
+export interface Summary { version_confirmed?: number; not_found?: number; source_failed?: number; budget_exhausted?: number; wrong_paper?: number; unverifiable?: number; unprocessed?: number; total: number; completed: number; running: number; queued: number; failed: number; cancelled: number; parse_errors: number; confirmed: number; conflicts: number; unresolved: number; upgrade_available: number; completion_available: number; problem_entries: number }
+export interface Task { report_revision?: number; finalized?: boolean; id: string; name: string; filename: string; mode: Mode; original_sha256: string; byte_size: number; encoding: string; created_at: string; updated_at: string; execution_status: Execution; error: string | null; config: Record<string, unknown>; summary: Summary; warnings: string[]; cost: Cost; original_url: string; report_url: string }
+export interface Diagnostic { code: string; message: string; line?: number; column?: number }
+export interface EntrySummary { journal?: string; booktitle?: string; classification?: EntryClassification | null; verification_supported?: boolean; id: string; task_id: string; ordinal: number; citation_key: string; entry_type: string; title: string; author: string; year: string; execution_status: Execution; identity_state: Identity; version_status: string; recommendation_status: RecommendationState; required_corrections?: string[]; has_conflict: boolean; conflict_count: number; completion_count: number; article_id: string | null; current_version_id: string | null; recommended_version_id: string | null; mode: Mode; diagnostics: Diagnostic[] }
+export interface Evidence { source_content_id: string; snapshot_id: string; field: string; locator: string }
+export interface Assessment { semantic_key?: string; label?: string; input_fields?: Record<string, string>; applicable?: boolean; field: string; original_value: string | null; reference_value: string | null; judgment: string; reason?: string; evidence: Evidence[] }
+export interface Relation { id: string; from_version_id: string; to_version_id: string; relation_type: string; status: string; reason: string; evidence: Evidence[] }
+export interface Proposal { id: string; proposal_type: 'same_version_patch' | 'whole_version_switch'; target_version_id: string; fields: Record<string, string>; remove_fields: string[]; bibtex: string; reason: string; evidence: Evidence[]; safe: boolean; blocked_reason: string | null }
+export interface SourceContent { id: string; provider: string; record_id: string; object_type: string; version_id: string | null; attribution_status: string; source_type: string; mode: Mode; url: string | null; fetched_at: string; checked_at: string | null; status: string; snapshot_id: string; snapshot_sha256: string; fields: Record<string, string>; field_coverage: string[]; extraction_method: string; snapshot_url: string; warnings: string[] }
+export interface FieldSelection { field: string; value: string | null; status: string; reason: string; evidence: Evidence[]; alternatives: { value: string; evidence: Evidence[] }[] }
+export interface Conflict { field: string; values: { value: string; evidence: Evidence[] }[]; reason: string }
+export interface Version { id: string; article_id: string; version_type: string; status: string; mode: Mode; merge_revision: number; identifiers: Record<string, string>; integrated_fields: Record<string, string>; field_selections: FieldSelection[]; conflicts: Conflict[]; sources: SourceContent[]; source_count: number; updated_at: string }
+export interface Candidate { snapshot_id?: string; source_content_id?: string; author_match?: string; title_similarity?: number | null; records?: Candidate[]; title: string; provider: string; record_id: string; url: string | null; reason: string; status: string }
+export interface EntryDetail extends EntrySummary { journal_checks?: { queried_issn: string; title: string; equivalent: boolean; snapshot_id: string }[]; auxiliary_fields?: { field: string; value: string; reason: string }[]; original_bib: string; fields: Record<string, string>; identity_reason: string; field_assessments: Assessment[]; recommendation: { status: RecommendationState; version_id: string | null; reason: string; revision: number; differences: Assessment[] }; current_version: Version | null; recommended_version: Version | null; version_relations: Relation[]; proposals: Proposal[]; sources: SourceContent[]; candidates: Candidate[]; excluded_candidates?: Candidate[]; calls: CallRecord[]; warnings: string[]; evidence_revision: { field_rule_version?: string; merge_revision: number | null; recommendation_revision: number | null; rule_version: string | null } }
+export interface Article { id: string; title: string; author: string; mode: Mode; recommended_version_id: string | null; recommendation_reason: string; recommendation_revision: number; version_count: number; source_count: number; updated_at: string; versions?: Version[]; version_relations?: Relation[] }
+export interface CallResponseSummary {
+  url?: string; http_status?: number; fetched_at?: string; byte_size?: number; body?: string;
+  truncated?: boolean; record_count?: number;
+  records?: { provider: string; record_id: string; url: string; fields: Record<string, string>; identifiers: Record<string, string> }[];
+}
+export interface CallRecord {
+  id: string; task_id: string | null; entry_id: string | null; provider: string; kind: string;
+  operation: string; status: string; started_at: string; duration_ms: number; attempt: number;
+  request_count?: number; cache_hit: boolean; mode: Mode; error_code: string | null; message: string | null;
+  usage: Record<string, number> | null; cost: Cost; request_summary?: string; http_status?: number;
+  fetched_at?: string; record_count?: number; report_revision?: number | null; response_summary?: CallResponseSummary;
+}
+export interface ExportSelection { entry_id: string; proposal_id: string; fields: string[] | null }
+export interface ExportChange { entry_id: string; citation_key: string; proposal_type: string; fields: string[]; before: string; after: string }
+export interface ExportPreview { filename: string; bibtex: string; original_sha256: string; output_sha256: string; changes: ExportChange[]; warnings: string[]; blocked: unknown[]; unchanged_entries: number; changed_entries: number }
+export interface ExportArtifact { id: string; filename: string; original_sha256: string; output_sha256: string; download_url: string; report_url: string; created_at: string }
+export interface SourceConfig { supports_api_key: boolean; id: string; name: string; enabled: boolean; implemented: boolean; requires_key: boolean; has_api_key: boolean; status: string; capabilities: string[]; api_key?: string }
+export type SettingLimits = Record<'runtime' | 'cache' | 'model', Record<string, { min: number; max: number }>>;
+export interface Settings { limits: SettingLimits; sources: SourceConfig[]; model: { enabled: boolean; library: string; protocol: string; model: string; base_url: string; has_api_key: boolean; timeout_seconds: number; max_retries: number; max_output_tokens: number; price_source: string; price: unknown; api_key?: string }; runtime: { entry_request_budget: number; request_budget: number; timeout_seconds: number; max_retries: number; concurrency: number; max_upload_bytes: number }; cache: { positive_ttl_seconds: number; negative_ttl_seconds: number; discovery_ttl_seconds: number }; audit: { enabled: boolean; retain_prompt_text: boolean; redact_secrets: boolean } }

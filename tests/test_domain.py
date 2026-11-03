@@ -1,0 +1,236 @@
+import sqlite3
+from copy import deepcopy
+
+import pytest
+
+from cite_audit.assessment import assess, brief_bib
+from cite_audit.knowledge import Knowledge, field_normalize, normalize
+from cite_audit.sources import BERT_TITLE, MOCK_BERT_RECORDS
+from cite_audit.storage import Store
+
+
+@pytest.fixture
+def kb(tmp_path):
+    return Knowledge(Store(tmp_path / 'knowledge.sqlite3'))
+
+
+def formal(provider='alpha', **fields):
+    r = deepcopy(MOCK_BERT_RECORDS[1])
+    r.update(provider=provider, record_id='publication', raw_payload=fields or {'initial': provider})
+    r['fields'].update(fields)
+    return r
+
+
+def test_same_version_complement_conflict_and_evidence(kb):
+    a = formal(); a['fields'].pop('pages')
+    b = formal('beta', title=BERT_TITLE.upper())
+    sources = kb.ingest([a, b], 'mock')
+    assert sources[0]['version_id'] == sources[1]['version_id']
+    v = kb.version(sources[0]['version_id'])
+    assert v['fields']['pages'] == '4171--4186'
+    assert v['field_selections']['pages']['evidence'][0]['source_content_id'] == sources[1]['id']
+    c = formal('gamma', pages='1--23')
+    kb.ingest([c], 'mock')
+    v = kb.version(v['id'])
+    assert 'pages' not in v['fields']
+    assert v['field_selections']['pages']['status'] == 'conflicting'
+    assert len(kb.store.all('SELECT id FROM versions')) == 1
+    assert kb.article(v['article_id'])['recommended_version_id'] is None
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_same_doi_subtitle_and_year_disagreement_preserve_identity(kb, reverse):
+    full = formal(title="A metric: measuring quality", year="2020")
+    short = formal("registry", title="A metric", year="2019")
+    records = [full, short]
+    sources = kb.ingest(records[::-1] if reverse else records, "mock")
+    result = assess(kb, {"fields": full["fields"], "entry_type": "inproceedings", "citation_key": "metric"},
+                    sources, "demo", [])
+    assert result["identity_state"] == "confirmed"
+    assert {c["field"] for c in result["current_version"]["conflicts"]} == {"title", "year"}
+    assert all(a["judgment"] == "unverifiable" for a in result["field_assessments"] if a["field"] in {"title", "year"})
+
+
+def test_updated_source_snapshot_reuses_version_without_self_conflict(kb):
+    a = formal(pages='1--9'); old = kb.ingest([a], 'mock')[0]
+    a['fields']['pages'] = '1--10'; a['raw_payload'] = {'revision': 2}
+    new = kb.ingest([a], 'mock')[0]
+    assert old['snapshot_id'] != new['snapshot_id']
+    assert old['version_id'] == new['version_id']
+    assert kb.version(new['version_id'])['fields']['pages'] == '1--10'
+    assert kb.source(old['id'])['fields']['pages'] == '1--9'
+    with pytest.raises(sqlite3.IntegrityError):
+        kb.store.execute('UPDATE snapshots SET content=? WHERE id=?', (b'changed', old['snapshot_id']))
+
+
+def test_preprint_formal_relation_and_current_version_semantics(kb):
+    sources = kb.ingest(deepcopy(MOCK_BERT_RECORDS), 'mock')
+    assert len(kb.store.all('SELECT id FROM articles')) == 1
+    assert len(kb.store.all('SELECT id FROM versions')) == 2
+    entry = {'fields': deepcopy(MOCK_BERT_RECORDS[0]['fields']), 'entry_type': 'article', 'citation_key': 'bert'}
+    result = assess(kb, entry, sources, 'demo', [])
+    assert result['identity_state'] == 'confirmed'
+    assert result['recommendation_status'] == 'upgrade_available'
+    assert not result['has_conflict']
+    assert result['current_version']['fields']['year'] == '2018'
+    assert result['recommended_version']['fields']['year'] == '2019'
+    assert 'eprint' not in result['recommended_version']['fields']
+    assert any(p['proposal_type'] == 'whole_version_switch' for p in result['proposals'])
+
+
+def test_ingest_skips_unrelated_recommendations(kb, monkeypatch):
+    kb.ingest([formal()], 'mock')
+    visited = []
+    monkeypatch.setattr(kb, "_recommend", visited.append)
+    kb.ingest([], 'mock')
+    assert visited == []
+    other = formal(title="Independent publication", doi="10.1000/independent")
+    other.update(identifiers={"doi": "10.1000/independent"}, record_id="independent", relations=[])
+    source = kb.ingest([other], 'mock')[0]
+    assert visited == [kb.version(source["version_id"])["article_id"]]
+    assert len(kb.store.all("SELECT id FROM articles")) == 2
+
+
+def test_mock_never_enters_online(kb):
+    assert kb.ingest(deepcopy(MOCK_BERT_RECORDS), 'online') == []
+    assert kb.store.all('SELECT id FROM articles') == []
+
+
+def test_relation_target_arriving_later_and_arxiv_revisions_keep_separate_fields(kb):
+    first, publication = deepcopy(MOCK_BERT_RECORDS[:2])
+    first["identifiers"]["arxiv"] = first["fields"]["eprint"] = "1810.04805v1"
+    second = deepcopy(first)
+    second.update(record_id="1810.04805v2", relations=[], raw_payload={"revision": 2})
+    second["identifiers"]["arxiv"] = second["fields"]["eprint"] = "1810.04805v2"
+    second["fields"]["year"] = "2020"
+    publication["relations"] = []
+    ids = [kb.ingest([record], "mock")[0]["version_id"] for record in (first, second, publication)]
+    versions = [kb.version(vid) for vid in ids]
+    assert len(set(ids)) == 3 and len({v["article_id"] for v in versions}) == 1
+    assert [v["fields"]["year"] for v in versions] == ["2018", "2020", "2019"]
+
+
+@pytest.mark.parametrize("field,value", [("doi", "10.18653/v1/n19-1423"),
+                                         ("url", "https://doi.org/10.18653/v1/n19-1423")])
+def test_wrong_identifier_does_not_replace_input(kb, field, value):
+    sources = kb.ingest([formal()], 'mock')
+    result = assess(kb, {'fields': {'title': 'A completely different paper', field: value},
+                         'entry_type': 'article', 'citation_key': 'wrong'}, sources, 'demo', [])
+    assert result['identity_state'] != 'confirmed'
+    assert result['proposals'] == []
+    assert result['identity_state'] == 'wrong_paper' and not result['has_conflict']
+    assert next(a for a in result['field_assessments'] if a['field'] == field)['evidence']
+
+
+def test_similar_title_no_relationship_never_links(kb):
+    a, b = formal(), formal('beta', doi='10.1111/extension', journal='Extended Research')
+    b['identifiers'] = {'doi': '10.1111/extension'}
+    kb.ingest([a,b], 'mock')
+    assert len(kb.store.all('SELECT id FROM articles')) == 2
+
+
+@pytest.mark.parametrize("anchor", ["doi", "url"])
+def test_title_can_be_corrected_after_independent_identity_match(kb, anchor):
+    record = formal()
+    sources = kb.ingest([record], "mock")
+    fields = {k: record["fields"][k] for k in (anchor, "year", "author", "booktitle")}
+    fields["title"] = "Unrelated input title"
+    result = assess(kb, {"fields": fields, "entry_type": "inproceedings", "citation_key": "test"}, sources, "demo", [])
+    assert result["identity_state"] == "confirmed"
+    assert any(p["fields"].get("title") == BERT_TITLE for p in result["proposals"])
+
+
+@pytest.mark.parametrize('field,left,right', [('doi','10.1/a-b','10.1/ab'),('pages','1--23','12--3'),('url','https://a/x-y','https://a/xy')])
+def test_meaningful_punctuation_is_not_erased(field,left,right):
+    assert field_normalize(field,left) != field_normalize(field,right)
+
+
+def test_title_language_symbols_are_not_erased():
+    assert normalize('C++ study') != normalize('C study')
+    assert field_normalize('title', '<scp>SummaC</scp>') == field_normalize('title', '{S}umma{C}')
+
+
+def test_publisher_pdf_eprint_does_not_override_formal_doi(kb):
+    source = kb.ingest([formal()], 'mock')[0]
+    fields = {**source['fields'], 'eprint': 'https://publisher.example/article.pdf'}
+    result = assess(kb, {'fields': fields, 'entry_type': 'inproceedings', 'citation_key': 'paper'},
+                    [source], 'demo', [])
+    assert result['current_version_id'] == source['version_id']
+
+
+def test_unsafe_copyable_proposal_is_empty():
+    assert brief_bib('k', {'entrytype':'article','title':r'bad}\n\input{secret}'}) == ''
+
+
+def test_arxiv_base_input_matches_specific_revision_but_other_revision_does_not(kb):
+    record = deepcopy(MOCK_BERT_RECORDS[0])
+    record['identifiers']['arxiv']='1810.04805v2'
+    record['fields']['eprint']='1810.04805v2'
+    sources = kb.ingest([record], 'mock')
+    entry={'fields':{'eprint':'1810.04805','title':BERT_TITLE},'entry_type':'article','citation_key':'bert'}
+    result = assess(kb,entry,sources,'demo',[])
+    assert result['identity_state']=='confirmed'
+    assert next(a for a in result['field_assessments'] if a['field']=='eprint')['judgment']=='consistent'
+    entry['fields'].update(version='v2', url='https://arxiv.org/abs/1810.04805v2')
+    assert assess(kb,entry,sources,'demo',[])['identity_state']=='confirmed'
+    entry['fields']['version']='v1'
+    assert assess(kb,entry,sources,'demo',[])['identity_state']!='confirmed'
+    entry['fields']['eprint']='1810.04805v1'
+    assert assess(kb,entry,sources,'demo',[])['identity_state']!='confirmed'
+
+
+def test_disjoint_official_ids_require_complete_publication_tuple(kb):
+    a,b=formal(),formal('beta')
+    a['identifiers']={'acl':'N19-1423'};a['fields'].pop('doi')
+    b['identifiers']={'pmlr':'v1/example'};b['fields'].pop('doi')
+    sources=kb.ingest([a,b],'mock')
+    assert sources[0]['version_id']==sources[1]['version_id']
+
+
+def test_conflicting_official_id_with_shared_doi_is_unresolved(kb):
+    a,b=formal(),formal('beta')
+    b['identifiers']['acl']='different-workshop-paper'
+    sources=kb.ingest([a,b],'mock')
+    assert sources[1]['version_id'] is None
+    assert len(kb.store.all('SELECT id FROM versions'))==1
+
+
+def test_raw_response_is_kept_in_snapshot_without_copying_into_source_and_report(kb):
+    record = formal()
+    record["raw_payload"] = {"body": "immutable response " * 1000}
+    source = kb.ingest([record], "mock")[0]
+    assert "raw_payload" not in source
+    stored = kb.store.one("SELECT data FROM sources WHERE id=?", (source["id"],))["data"]
+    assert "immutable response" not in stored
+    snapshot = kb.store.one("SELECT content FROM snapshots WHERE id=?", (source["snapshot_id"],))["content"]
+    assert b"immutable response" in snapshot
+    result = assess(kb, {"fields": record["fields"], "entry_type": "inproceedings", "citation_key": "k"},
+                    [source], "demo", [])
+    assert result["identity_state"] == "confirmed"
+    assert result["sources"][0]["snapshot_id"] == source["snapshot_id"]
+    assert "immutable response" not in str(result)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_workshop_forum_on_main_conference_citation(kb, reverse):
+    records = []
+    for provider, forum, venue, year in [
+        ("openreview", "Workshop01", "Example Workshop", "2023"),
+        ("openreview", "MainTrack1", "Example Conference", "2024"),
+    ]:
+        url = "https://openreview.net/forum?id=" + forum
+        fields = {"title": "An example paper", "author": "Jane Smith and Adam Jones",
+                  "year": year, "entrytype": "inproceedings", "booktitle": venue, "url": url}
+        records.append({"provider": provider, "record_id": forum, "fields": fields, "source_url": url,
+                        "raw_payload": fields, "identifiers": {"openreview": forum}, "status": "mock",
+                        "identity_basis": "official_id", "source_type": "mock"})
+    records[1]["venue_id"] = "Example.org/2024/Conference"
+    sources = [kb.ingest([r], "mock")[0] for r in (records[::-1] if reverse else records)]
+    entry = {"fields": {**records[1]["fields"], "url": records[0]["source_url"]},
+             "entry_type": "inproceedings", "citation_key": "mixed"}
+    result = assess(kb, entry, sources, "demo", [])
+    assert result["identity_state"] == "confirmed"
+    assert result["recommendation_status"] == "same_version"
+    assert kb.article(result["current_version"]["article_id"])["version_count"] == 2
+    url = next(a for a in result["field_assessments"] if a["field"] == "url")
+    assert (url["judgment"], url["reference_value"]) == ("conflict", records[1]["source_url"])
