@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 def plain_title(value: str) -> str:
     """Remove known publisher styling while preserving the enclosed title text."""
     return re.sub(r"</?(?:i|b|em|strong|italic|bold|scp|jats:italic|jats:bold|jats:sc)\s*>",
-                  "", html.unescape(value), flags=re.I)
+                  "", html.unescape(value), flags=re.IGNORECASE)
 
 
 def iclr_paper_id(url: str) -> str | None:
@@ -45,7 +45,7 @@ def venue_normalize(value: str | None) -> str:
     if re.fullmatch(r"\s*(?:(?:proceedings of )?(?:the )?(?:(?:first|second|third|fourth|fifth|sixth|seventh|"
                     r"eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|\d+(?:st|nd|rd|th)) )?"
                     r"international conference on learning representations(?:\s*\(iclr(?: \d{4})?\))?|iclr)"
-                    r"(?:[\s,]+\d{4})?\s*", text, re.I) and "workshop" not in text.casefold():
+                    r"(?:[\s,]+\d{4})?\s*", text, re.IGNORECASE) and "workshop" not in text.casefold():
         return "iclr"
     return normalize(re.sub(r"&;?", " and ", text))
 

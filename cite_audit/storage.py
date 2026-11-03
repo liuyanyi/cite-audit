@@ -4,14 +4,12 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-
 import threading
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-
 
 from .entry_status import summary_expressions
 from .fields import required_corrections

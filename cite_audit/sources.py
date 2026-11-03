@@ -1216,10 +1216,10 @@ class SourceRegistry:
         response = await session.get("colm", "search", url)
         if response.status == 404:
             return []
-        for paragraph in re.findall(r"<p\b[^>]*>(.*?)</p>", response.body.decode("utf-8"), re.I | re.S):
+        for paragraph in re.findall(r"<p\b[^>]*>(.*?)</p>", response.body.decode("utf-8"), re.IGNORECASE | re.DOTALL):
             page = _HTML()
             page.feed(paragraph)
-            authors = re.search(r"<em>([^<>]+)</em>", paragraph, re.I)
+            authors = re.search(r"<em>([^<>]+)</em>", paragraph, re.IGNORECASE)
             if not authors:
                 continue
             for href, title in page.links:
@@ -1385,9 +1385,9 @@ class SourceRegistry:
         if (not ids and venue_normalize(fields.get("booktitle")) == "icml" and fields.get("title")
                 and re.fullmatch(r"\d{4}", fields.get("year", ""))):
             index = await session.get("pmlr", "search", "https://proceedings.mlr.press/")
-            for row in re.findall(r"<li\b[^>]*>(.*?)</li>", index.body.decode("utf-8"), re.I | re.S):
+            for row in re.findall(r"<li\b[^>]*>(.*?)</li>", index.body.decode("utf-8"), re.IGNORECASE | re.DOTALL):
                 label = clean(re.sub(r"<[^>]+>", " ", row))
-                match = re.fullmatch(rf"Volume (\d+) Proceedings of ICML {fields['year']}", label, re.I)
+                match = re.fullmatch(rf"Volume (\d+) Proceedings of ICML {fields['year']}", label, re.IGNORECASE)
                 if match:
                     volume = match[1]
                     break
@@ -1397,7 +1397,7 @@ class SourceRegistry:
                 page = _HTML()
                 page.feed(response.body.decode("utf-8"))
                 for block in re.split(r'<div\s+class="paper">', response.body.decode("utf-8"))[1:]:
-                    heading = re.search(r'<p\s+class="title">(.*?)</p>', block, re.S)
+                    heading = re.search(r'<p\s+class="title">(.*?)</p>', block, re.DOTALL)
                     if heading and normalize(re.sub(r"<[^>]+>", "", heading[1])) == normalize(fields["title"]):
                         paper = _HTML()
                         paper.feed(block)

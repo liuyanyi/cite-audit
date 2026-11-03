@@ -47,7 +47,7 @@ def arxiv_match(fields: dict, candidate: str) -> tuple[bool, str]:
     if re.fullmatch(r"v?\d+", version):
         revisions.add("v" + version.removeprefix("v"))
     url = str(fields.get("url", ""))
-    if re.match(r"^https?://arxiv\.org/(abs|pdf)/", url, re.I):
+    if re.match(r"^https?://arxiv\.org/(abs|pdf)/", url, re.IGNORECASE):
         linked = normalize_id("arxiv", url.split("?", 1)[0].split("#", 1)[0])
         if re.sub(r"v\d+$", "", linked) != base:
             return False, "输入 URL 与 eprint 的 arXiv 基础编号不同"
@@ -156,7 +156,7 @@ def assess(knowledge: Knowledge, entry: dict, source_records: list[dict], mode: 
                         or normalize_id("doi", url) == ids.get("doi")
                         or openreview_id(url) and openreview_id(url) == ids.get("openreview")
                         or iclr_paper_id(url) and iclr_paper_id(url) == ids.get("iclr")
-                        or re.match(r"^https?://arxiv\.org/(?:abs|pdf)/", url, re.I)
+                        or re.match(r"^https?://arxiv\.org/(?:abs|pdf)/", url, re.IGNORECASE)
                         and normalize_id("arxiv", url) == ids.get("arxiv")):
                 wrong_targets.setdefault("url", []).append(source)
         else:

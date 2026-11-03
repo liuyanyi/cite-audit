@@ -461,6 +461,7 @@ def test_listing_entries_uses_a_bounded_number_of_reads(service, monkeypatch):
 
 async def test_task_batches_arxiv_ids_with_one_remaining_request(tmp_path):
     from urllib.parse import parse_qs, urlsplit
+
     from cite_audit.policy import PROVIDERS
     from cite_audit.sources import Response, SourceRegistry
 

@@ -11,9 +11,16 @@ from pathlib import Path
 from . import presenters
 from .assessment import assess, current_match
 from .bib import parse_bib, preview_export
-from .entry_status import CLASSIFICATION_SQL, GROUPS, SUPPORTED_SQL, classification, summary_expressions, verification_supported
-from .fields import required_corrections
+from .entry_status import (
+    CLASSIFICATION_SQL,
+    GROUPS,
+    SUPPORTED_SQL,
+    classification,
+    summary_expressions,
+    verification_supported,
+)
 from .events import TaskEvents
+from .fields import required_corrections
 from .journals import issns, journal_matches
 from .knowledge import Knowledge, field_normalize, identifiers
 from .matching import author_match, normalize, plain_title

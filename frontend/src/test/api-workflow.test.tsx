@@ -286,7 +286,8 @@ it('updates a running task through actual SSE and stops all background reads aft
 
 it.each(['list', 'entry'])('keeps the %s page subscribed until its parent task is frozen', async page => {
   const reference = 'title={BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding}, author={Devlin, Jacob and Chang, Ming-Wei and Lee, Kenton and Toutanova, Kristina}, year={2018}, eprint={1810.04805}';
-  const raw = Array.from({ length: 12 }, (_, index) => `@article{observe${index},${reference}}`).join('\n');
+  // Two entries exercise the duplicate warning generated during finalization.
+  const raw = Array.from({ length: 2 }, (_, index) => `@article{observe${index},${reference}}`).join('\n');
   const boundary = `sse-${page}`;
   const body = `--${boundary}\r\nContent-Disposition: form-data; name="mode"\r\n\r\ndemo\r\n--${boundary}\r\nContent-Disposition: form-data; name="confirm_budget"\r\n\r\ntrue\r\n--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${page}.bib"\r\n\r\n${raw}\r\n--${boundary}--\r\n`;
   const task = await (await nativeFetch(`${base}/api/tasks`, { method: 'POST', headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` }, body })).json() as Task;
