@@ -138,7 +138,8 @@ file and opens request settings) or **按当前预算继续** (resubmits the sam
 - `GET /tasks/{id}/original`: exact bytes, safe attachment filename; never reserialize.
 - `GET /tasks/{id}/report`: `{ "task": Task, "entries": [EntryDetail], "calls": [CallRecord], "generated_at": timestamp }`; final reports freeze actual evidence/revisions.
 - `POST /tasks/{id}/cancel`: return Task, retain completed results.
-- `POST /tasks/{id}/retry`: create and return a fresh Task from immutable original bytes and configuration. This operation never overwrites old reports or inherits conclusions; UI explicitly says it creates a new task. Process-restart recovery resumes unfinished work internally.
+- `POST /tasks/{id}/retry`: requeue entries within the same finalized Task, preserving task/entry IDs, immutable original bytes, prior report revisions and existing exports. With no body, rerun all entries. An explicit selection supplies `revision` (the current report revision), `scope=all|categories|entries`, and `categories` or `entry_ids` for the respective scope; online reruns may supply `entry_request_budget` and `request_budget`. Only selected results are reset. Stale revisions and duplicate requests cannot overwrite a newer round. Process-restart recovery resumes unfinished work internally.
+- `POST /tasks/{id}/entries/{entry_id}/retry`: recheck this entry within the same finalized Task; other entries and archived reports remain unchanged. Report revision downloads are listed by `GET /tasks/{id}/reports`.
 - `DELETE /tasks/{id}`: return `{ "deleted": true, "knowledge_preserved": true }`; UI confirms task-only scope. The upload is deleted only when no remaining task references its hash. Shared knowledge and snapshots are preserved.
 
 ## Entries
